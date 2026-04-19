@@ -1,7 +1,10 @@
+import json
 import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from .cpa_client import CPAClient
 from .logging_utils import ConsoleLogger, TokenLogger
@@ -30,6 +33,10 @@ class CPACodexKeeper:
         )
         self.stats = MaintainerStats()
         self._stats_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self.disabled_accounts_path = Path(__file__).resolve().parents[1] / "disabled_accounts.json"
+        self._tracked_disabled_accounts = self._load_disabled_accounts_state()
+        self.last_usage_query_time: int | None = None
 
     def reset_stats(self):
         with self._stats_lock:
@@ -104,6 +111,240 @@ class CPACodexKeeper:
             "has_credits": usage.has_credits,
         }
 
+    def get_usage_log(self):
+        return self.cpa_client.get_usage_log(lookback_seconds=self.settings.usage_query_interval_seconds)
+
+    def _load_disabled_accounts_state(self):
+        if not self.disabled_accounts_path.exists():
+            return {}
+        try:
+            data = json.loads(self.disabled_accounts_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.log("ERROR", f"加载禁用账号计划失败: {exc}")
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def _save_disabled_accounts_state(self):
+        payload = json.dumps(self._tracked_disabled_accounts, ensure_ascii=False, indent=2, sort_keys=True)
+        self.disabled_accounts_path.write_text(payload + "\n", encoding="utf-8")
+
+    def _get_tracked_next_check_at(self, name):
+        entry = self._tracked_disabled_accounts.get(name)
+        if not isinstance(entry, dict):
+            return None
+        value = entry.get("next_check_at")
+        return value if isinstance(value, int) else None
+
+    def _format_tracked_next_check_at(self, ts):
+        try:
+            tz = timezone(timedelta(hours=8))
+            return datetime.fromtimestamp(int(ts), tz=tz).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return str(ts)
+
+    def _set_tracked_next_check_at(self, name, ts):
+        with self._state_lock:
+            self._tracked_disabled_accounts[name] = {"next_check_at": int(ts)}
+            self._save_disabled_accounts_state()
+
+    def _remove_tracked_account(self, name):
+        with self._state_lock:
+            if name in self._tracked_disabled_accounts:
+                self._tracked_disabled_accounts.pop(name)
+                self._save_disabled_accounts_state()
+
+    def _collect_threshold_reaching_reset_ats(self, body_info):
+        reached_reset_ats = []
+        primary_pct = body_info.get("primary_used_percent", 0)
+        if primary_pct >= self.settings.quota_threshold:
+            primary_reset_at = body_info.get("primary_reset_at")
+            if isinstance(primary_reset_at, int):
+                reached_reset_ats.append(primary_reset_at)
+        secondary_pct = body_info.get("secondary_used_percent")
+        if secondary_pct is not None and secondary_pct >= self.settings.quota_threshold:
+            secondary_reset_at = body_info.get("secondary_reset_at")
+            if isinstance(secondary_reset_at, int):
+                reached_reset_ats.append(secondary_reset_at)
+        return reached_reset_ats
+
+    def _collect_threshold_reaching_window_seconds(self, body_info):
+        window_seconds = []
+        primary_pct = body_info.get("primary_used_percent", 0)
+        primary_window_seconds = body_info.get("primary_window_seconds")
+        if primary_pct >= self.settings.quota_threshold and isinstance(primary_window_seconds, int):
+            window_seconds.append(primary_window_seconds)
+        secondary_pct = body_info.get("secondary_used_percent")
+        secondary_window_seconds = body_info.get("secondary_window_seconds")
+        if secondary_pct is not None and secondary_pct >= self.settings.quota_threshold and isinstance(secondary_window_seconds, int):
+            window_seconds.append(secondary_window_seconds)
+        return window_seconds
+
+    def _extract_usage_detail_entries(self, usage_data):
+        entries = []
+        try:
+            apis = usage_data.get("usage", {}).get("apis", {})
+            for api_data in apis.values():
+                models = api_data.get("models", {})
+                for model_data in models.values():
+                    details = model_data.get("details", [])
+                    for detail in details:
+                        source = detail.get("source")
+                        timestamp = detail.get("timestamp")
+                        if source and timestamp:
+                            entries.append((source, timestamp))
+        except AttributeError:
+            return []
+        return entries
+
+    def _parse_usage_detail_timestamp(self, value):
+        if not value:
+            return None
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        dot_index = normalized.find(".")
+        if dot_index != -1:
+            tz_plus = normalized.rfind("+")
+            tz_minus = normalized.rfind("-")
+            tz_index = max(tz_plus, tz_minus)
+            if tz_index > dot_index:
+                fraction = normalized[dot_index + 1:tz_index]
+                if len(fraction) > 6:
+                    normalized = normalized[:dot_index + 1] + fraction[:6] + normalized[tz_index:]
+        try:
+            return int(datetime.fromisoformat(normalized).timestamp())
+        except ValueError:
+            return None
+
+    def _latest_usage_timestamp_for_token(self, usage_data, token_detail):
+        email = ((token_detail or {}).get("email") or "").strip().lower()
+        if not email or not usage_data:
+            return None
+        latest_timestamp = None
+        for source, raw_timestamp in self._extract_usage_detail_entries(usage_data):
+            if (source or "").strip().lower() != email:
+                continue
+            parsed_timestamp = self._parse_usage_detail_timestamp(raw_timestamp)
+            if parsed_timestamp is None:
+                continue
+            if latest_timestamp is None or parsed_timestamp > latest_timestamp:
+                latest_timestamp = parsed_timestamp
+        return latest_timestamp
+
+    def _compute_next_check_at_from_usage(self, body_info, now, fallback_seconds, *, usage_data=None, token_detail=None):
+        reached_reset_ats = self._collect_threshold_reaching_reset_ats(body_info)
+        if reached_reset_ats:
+            return max(reached_reset_ats)
+        if usage_data is None and token_detail is not None:
+            usage_data = self.get_usage_log()
+        latest_usage_timestamp = self._latest_usage_timestamp_for_token(usage_data, token_detail)
+        if latest_usage_timestamp is not None:
+            window_seconds = self._collect_threshold_reaching_window_seconds(body_info)
+            if window_seconds:
+                return max(latest_usage_timestamp + seconds for seconds in window_seconds)
+        return now + fallback_seconds
+
+    def _latest_usage_timestamp_by_email(self, usage_data, *, after_timestamp=None):
+        latest_by_email = {}
+        for source, raw_timestamp in self._extract_usage_detail_entries(usage_data or {}):
+            email = (source or "").strip().lower()
+            parsed_timestamp = self._parse_usage_detail_timestamp(raw_timestamp)
+            if not email or parsed_timestamp is None:
+                continue
+            if after_timestamp is not None and parsed_timestamp <= after_timestamp:
+                continue
+            current = latest_by_email.get(email)
+            if current is None or parsed_timestamp > current:
+                latest_by_email[email] = parsed_timestamp
+        return latest_by_email
+
+    def get_fill_token_map(self):
+        email_map = {}
+        for token in self.get_token_list():
+            email = (token.get("email") or "").strip().lower()
+            enriched_token = dict(token)
+            if not email:
+                detail = self.get_token_detail(token.get("name", ""))
+                email = ((detail or {}).get("email") or "").strip().lower()
+                if email:
+                    enriched_token["email"] = email
+            if email and email not in email_map:
+                email_map[email] = enriched_token
+        return email_map
+
+    def _fill_quota_reached_summary(self, primary_pct, secondary_pct, primary_label, secondary_label):
+        primary_reached = primary_pct >= self.settings.quota_threshold
+        secondary_reached = secondary_pct is not None and secondary_pct >= self.settings.quota_threshold
+        reached_parts = []
+        if primary_reached:
+            reached_parts.append(f"{primary_label}额度 {primary_pct}%")
+        if secondary_reached:
+            reached_parts.append(f"{secondary_label}额度 {secondary_pct}%")
+        return "、".join(reached_parts), primary_reached or secondary_reached
+
+    def process_fill_token(self, token_info, idx, total):
+        name = token_info.get("name", "unknown")
+        logger = TokenLogger(self.logger, idx, total, name)
+        try:
+            logger.log("INFO", "获取详情...", indent=1)
+            token_detail = self.get_token_detail(name)
+            if not token_detail:
+                return self._skip_token("获取详情失败", logger)
+
+            disabled, _, _, _ = self._log_token_details(token_detail, logger)
+            if disabled:
+                logger.log("INFO", "已禁用，fill 模式跳过", indent=1)
+                self._inc_stat("alive")
+                logger.blank_line()
+                return "alive"
+
+            access_token = token_detail.get("access_token")
+            account_id = token_detail.get("account_id")
+            if not access_token:
+                return self._skip_token("缺少 access_token", logger)
+
+            logger.log("INFO", "检测在线状态...", indent=1)
+            status, resp_data = self.check_token_live(access_token, account_id)
+            if status in (401, 402):
+                return self._skip_token(f"状态异常 ({status})", logger)
+            if status is None:
+                detail = resp_data.get("brief", "") if isinstance(resp_data, dict) else str(resp_data)
+                msg = "网络检测失败"
+                if detail:
+                    msg += f" | {detail}"
+                return self._skip_token(msg, logger, network_error=True)
+            if status != 200:
+                return self._handle_non_200_status(status, resp_data, logger)
+
+            body_info = self.parse_usage_info(resp_data)
+            primary_pct, secondary_pct, primary_label, secondary_label = self._log_usage_summary(body_info, logger)
+            reached_summary, quota_reached = self._fill_quota_reached_summary(
+                primary_pct,
+                secondary_pct,
+                primary_label,
+                secondary_label,
+            )
+            if quota_reached:
+                logger.log(
+                    "WARN",
+                    f"{reached_summary} >= {self.settings.quota_threshold}%，准备禁用",
+                    indent=1,
+                )
+                if self.set_disabled_status(name, disabled=True, logger=logger):
+                    logger.log("DISABLE", "已禁用", indent=1)
+                    self._inc_stat("disabled")
+                    logger.blank_line()
+                    return "disabled"
+                return self._skip_token("禁用失败", logger)
+
+            self._inc_stat("alive")
+            logger.blank_line()
+            return "alive"
+        finally:
+            logger.flush()
+
     def try_refresh(self, token_data):
         rt = token_data.get("refresh_token")
         if not rt:
@@ -157,6 +398,7 @@ class CPACodexKeeper:
     def _delete_token_with_reason(self, name, reason, logger):
         logger.log("WARN", reason, indent=1)
         if self.delete_token(name, logger=logger):
+            self._remove_tracked_account(name)
             logger.log("DELETE", "已删除", indent=1)
             self._inc_stat("dead")
             logger.blank_line()
@@ -206,11 +448,15 @@ class CPACodexKeeper:
         has_refresh_token=True,
         primary_label="primary_window",
         secondary_label="secondary_window",
+        body_info=None,
+        token_detail=None,
+        now=None,
     ):
         primary_reached = primary_pct >= self.settings.quota_threshold
         secondary_present = secondary_pct is not None
         secondary_reached = secondary_present and secondary_pct >= self.settings.quota_threshold
         effective_disabled = disabled
+        tracked_next_check_at = self._get_tracked_next_check_at(name)
 
         if secondary_present:
             below_threshold = primary_pct < self.settings.quota_threshold and secondary_pct < self.settings.quota_threshold
@@ -226,6 +472,9 @@ class CPACodexKeeper:
 
         if disabled:
             if below_threshold:
+                if tracked_next_check_at is None:
+                    logger.log("INFO", "已禁用且未被 keeper 纳入自动复查，保持禁用", indent=1)
+                    return None, effective_disabled
                 if secondary_present:
                     logger.log(
                         "WARN",
@@ -239,6 +488,7 @@ class CPACodexKeeper:
                         indent=1,
                     )
                 if self.set_disabled_status(name, disabled=False, logger=logger):
+                    self._remove_tracked_account(name)
                     logger.log("ENABLE", "已重新启用", indent=1)
                     self._inc_stat("enabled")
                     effective_disabled = False
@@ -251,6 +501,20 @@ class CPACodexKeeper:
                     f"无 Refresh Token，且{reached_summary} >= {self.settings.quota_threshold}%，准备删除",
                     logger,
                 ), effective_disabled
+            if tracked_next_check_at is not None and body_info is not None and now is not None:
+                next_check_at = self._compute_next_check_at_from_usage(
+                    body_info,
+                    now,
+                    self.settings.interval_seconds,
+                    token_detail=token_detail,
+                )
+                self._set_tracked_next_check_at(name, next_check_at)
+                logger.log(
+                    "INFO",
+                    f"已禁用，{reached_summary} >= {self.settings.quota_threshold}%，保持禁用并重排到 {self._format_tracked_next_check_at(next_check_at)}",
+                    indent=1,
+                )
+                return None, effective_disabled
             logger.log(
                 "INFO",
                 f"已禁用，{reached_summary} >= {self.settings.quota_threshold}%，保持禁用",
@@ -271,9 +535,17 @@ class CPACodexKeeper:
                 indent=1,
             )
             if self.set_disabled_status(name, disabled=True, logger=logger):
-                logger.log("DISABLE", "已禁用", indent=1)
-                self._inc_stat("disabled")
                 effective_disabled = True
+                next_check_at = self._compute_next_check_at_from_usage(
+                    body_info or {},
+                    now if now is not None else int(time.time()),
+                    self.settings.quota_reset_none_recheck_seconds,
+                    token_detail=token_detail,
+                )
+                self._set_tracked_next_check_at(name, next_check_at)
+                logger.log("DISABLE", "已禁用", indent=1)
+                logger.log("INFO", f"已记录下次检查额度时间: {self._format_tracked_next_check_at(next_check_at)}", indent=1)
+                self._inc_stat("disabled")
             else:
                 logger.log("ERROR", "禁用失败", indent=1)
             return None, effective_disabled
@@ -326,6 +598,8 @@ class CPACodexKeeper:
                 return self._skip_token("获取详情失败", logger)
 
             disabled, remaining_seconds, remaining_str, expiry_known = self._log_token_details(token_detail, logger)
+            tracked_next_check_at = self._get_tracked_next_check_at(name)
+            now = int(time.time())
             cleanup_result = self._apply_non_refreshable_expiry_policy(name, token_detail, remaining_seconds, expiry_known, logger)
             if cleanup_result:
                 return cleanup_result
@@ -333,6 +607,15 @@ class CPACodexKeeper:
             account_id = token_detail.get("account_id")
             if not access_token:
                 return self._skip_token("缺少 access_token", logger)
+            if disabled and tracked_next_check_at is not None and now < tracked_next_check_at:
+                logger.log(
+                    "INFO",
+                    f"已禁用，计划于 {self._format_tracked_next_check_at(tracked_next_check_at)} 后复查使用额度，当前跳过",
+                    indent=1,
+                )
+                self._inc_stat("alive")
+                logger.blank_line()
+                return "alive"
 
             logger.log("INFO", "检测在线状态...", indent=1)
             status, resp_data = self.check_token_live(access_token, account_id)
@@ -358,6 +641,9 @@ class CPACodexKeeper:
                 has_refresh_token=self._has_refresh_token(token_detail),
                 primary_label=primary_label,
                 secondary_label=secondary_label,
+                body_info=body_info,
+                token_detail=token_detail,
+                now=now,
             )
             if quota_result:
                 return quota_result
@@ -377,15 +663,26 @@ class CPACodexKeeper:
             logger.flush()
 
     def log_startup(self):
-        self.logger.divider()
-        self.log("INFO", "CPACodexKeeper 启动")
-        self.log("INFO", f"API: {self.settings.cpa_endpoint}")
-        self.log("INFO", f"Quota threshold: {self.settings.quota_threshold}% (disable when reached)")
-        self.log("INFO", f"Expiry threshold: {self.settings.expiry_threshold_days} days (refresh disabled auth when below)")
-        self.log("INFO", f"Refresh enabled: {self.settings.enable_refresh}")
+        info_prefix = self.logger.PREFIX_MAP["INFO"]
+        dry_prefix = self.logger.PREFIX_MAP["DRY"]
+        usage_query_interval_display = (
+            "disabled"
+            if self.settings.usage_query_interval_seconds == 0
+            else f"{self.settings.usage_query_interval_seconds} seconds"
+        )
+        lines = [
+            "=" * 60,
+            f"{info_prefix} CPACodexKeeper 启动",
+            f"{info_prefix} API: {self.settings.cpa_endpoint}",
+            f"{info_prefix} Quota threshold: {self.settings.quota_threshold}% (disable when reached)",
+            f"{info_prefix} Expiry threshold: {self.settings.expiry_threshold_days} days (refresh disabled auth when below)",
+            f"{info_prefix} Usage query interval: {usage_query_interval_display}",
+            f"{info_prefix} Refresh enabled: {self.settings.enable_refresh}",
+        ]
         if self.dry_run:
-            self.log("DRY", "演练模式 (不实际修改)")
-        self.logger.divider()
+            lines.append(f"{dry_prefix} 演练模式 (不实际修改)")
+        lines.append("=" * 60)
+        self.logger.emit_lines(lines)
 
     def run(self):
         self.reset_stats()
@@ -447,4 +744,52 @@ class CPACodexKeeper:
             except Exception as exc:
                 self.log("ERROR", f"第 {round_no} 轮巡检异常: {exc}")
             self.log("INFO", f"等待 {interval_seconds} 秒后开始下一轮")
+            time.sleep(interval_seconds)
+
+    def run_fill_once(self):
+        if self.settings.usage_query_interval_seconds == 0:
+            self.log("INFO", "fill 模式 usage 日志查询已禁用")
+            return "disabled"
+
+        now = int(time.time())
+        if self.last_usage_query_time is None:
+            self.last_usage_query_time = now
+            self.log("INFO", "fill 模式首次启动，已记录查询时间，等待下一轮")
+            return "primed"
+
+        query_started_at = now
+        usage_data = self.get_usage_log()
+        if not usage_data:
+            self.last_usage_query_time = query_started_at
+            self.log("WARN", "fill 模式未获取到 usage 日志")
+            return "skipped"
+
+        latest_by_email = self._latest_usage_timestamp_by_email(usage_data, after_timestamp=self.last_usage_query_time)
+        token_map = self.get_fill_token_map()
+        matched_tokens = [token_map[email] for email in latest_by_email if email in token_map]
+
+        total = len(matched_tokens)
+        if total:
+            self.reset_stats()
+            self._set_total(total)
+            for idx, token_info in enumerate(matched_tokens, 1):
+                self.process_fill_token(token_info, idx, total)
+
+        self.last_usage_query_time = query_started_at
+        return "processed"
+
+    def run_fill_forever(self, interval_seconds=10):
+        round_no = 0
+        self.log("INFO", f"fill 模式启动，执行间隔: {interval_seconds} 秒")
+        while True:
+            round_no += 1
+            self.log("INFO", f"开始第 {round_no} 轮 fill 巡检")
+            try:
+                self.run_fill_once()
+                self.log("INFO", f"第 {round_no} 轮 fill 巡检结束")
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                self.log("ERROR", f"第 {round_no} 轮 fill 巡检异常: {exc}")
+            self.log("INFO", f"等待 {interval_seconds} 秒后开始下一轮 fill 巡检")
             time.sleep(interval_seconds)

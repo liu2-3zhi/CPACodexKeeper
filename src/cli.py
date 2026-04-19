@@ -1,3 +1,5 @@
+import threading
+
 from .maintainer import CPACodexKeeper
 from .settings import SettingsError, load_settings
 
@@ -22,6 +24,14 @@ def main() -> int:
 
     maintainer = CPACodexKeeper(settings=settings, dry_run=args.dry_run)
     if args.daemon:
+        if settings.usage_query_interval_seconds > 0:
+            fill_maintainer = CPACodexKeeper(settings=settings, dry_run=args.dry_run)
+            fill_thread = threading.Thread(
+                target=fill_maintainer.run_fill_forever,
+                kwargs={"interval_seconds": settings.usage_query_interval_seconds},
+                daemon=True,
+            )
+            fill_thread.start()
         maintainer.run_forever(interval_seconds=settings.interval_seconds)
         return 0
     maintainer.run()

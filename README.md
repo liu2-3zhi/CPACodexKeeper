@@ -136,16 +136,20 @@ cp .env.example .env
 - `CPA_PROXY`：可选代理
 - `CPA_INTERVAL`：守护模式轮询间隔，默认 `1800`
 - `CPA_QUOTA_THRESHOLD`：禁用阈值，默认 `100`
+- `CPA_QUOTA_RESET_NONE_RECHECK_SECONDS`：达到禁用阈值但对应 quota 窗口没有 `reset_at` 时的回查秒数，默认 `18000`
 - `CPA_EXPIRY_THRESHOLD_DAYS`：禁用 token 的刷新阈值天数，默认 `3`
 - `CPA_ENABLE_REFRESH`：是否启用对禁用 token 的自动刷新，默认 `true`
 - `CPA_HTTP_TIMEOUT`：CPA API 请求超时秒数，默认 `30`
 - `CPA_USAGE_TIMEOUT`：OpenAI usage 请求超时秒数，默认 `15`
+- `CPA_USAGE_QUERY_INTERVAL`：查询 CPA `/v0/management/usage` 日志时的回溯窗口秒数，默认 `7200`
 - `CPA_MAX_RETRIES`：临时网络 / 5xx 错误重试次数，默认 `2`
 - `CPA_WORKER_THREADS`：单轮巡检的并发线程数，默认 `8`
 
 推荐直接参考 `.env.example` 中的中英双语注释填写。
 
 默认开启自动刷新，但 keeper 仍只会刷新当前轮处理后仍处于禁用状态的 token；启用状态 token 交给 CPA 自己的自动刷新逻辑处理。如果你需要避免与其他刷新写入方竞争，可以在 `.env` 里显式设成 `false`。
+
+程序会在项目根目录维护 `disabled_accounts.json`，用于记录 keeper 因 quota 达到 `CPA_QUOTA_THRESHOLD` 而自动禁用账号的下一次复查时间。只有被 keeper 自动禁用的账号才会进入这份状态文件；手动禁用账号不会被自动启用。若达到阈值的窗口没有 `reset_at`，首次会使用 `CPA_QUOTA_RESET_NONE_RECHECK_SECONDS` 兜底；后续到点复查后若仍没有新的 `reset_at`，则按 `CPA_INTERVAL` 继续顺延。
 
 ---
 
