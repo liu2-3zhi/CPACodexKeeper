@@ -14,10 +14,81 @@ from .settings import Settings
 from .utils import format_seconds, get_expired_remaining, get_expired_remaining_with_status
 
 
+class PriorityCoordinator:
+    PRIORITY_VALUE = {
+        "full": 1,
+        "log": 2,
+        "timer": 3,
+    }
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._pending = {name: 0 for name in self.PRIORITY_VALUE}
+        self._active = {name: 0 for name in self.PRIORITY_VALUE}
+
+    def _blocking_priority_locked(self, priority):
+        value = self.PRIORITY_VALUE[priority]
+        blocking = [
+            name
+            for name in self.PRIORITY_VALUE
+            if self._pending[name] > 0 and self.PRIORITY_VALUE[name] > value
+        ]
+        if not blocking:
+            return None
+        return max(blocking, key=self.PRIORITY_VALUE.get)
+
+    def request(self, priority):
+        with self._condition:
+            self._pending[priority] += 1
+            self._condition.notify_all()
+
+    def blocking_priority(self, priority):
+        with self._condition:
+            return self._blocking_priority_locked(priority)
+
+    def has_pending(self, priority):
+        with self._condition:
+            return self._pending[priority] > 0
+
+    def has_active(self, priority):
+        with self._condition:
+            return self._active[priority] > 0
+
+    def has_lower_work(self, priority):
+        with self._condition:
+            value = self.PRIORITY_VALUE[priority]
+            return any(
+                self.PRIORITY_VALUE[name] < value and (self._pending[name] > 0 or self._active[name] > 0)
+                for name in self.PRIORITY_VALUE
+            )
+
+    def can_start(self, priority):
+        with self._condition:
+            return self._blocking_priority_locked(priority) is None
+
+    def acquire_next(self, priority):
+        with self._condition:
+            while self._blocking_priority_locked(priority) is not None:
+                self._condition.wait()
+            self._pending[priority] -= 1
+            self._active[priority] += 1
+
+    def release(self, priority):
+        with self._condition:
+            self._active[priority] -= 1
+            self._condition.notify_all()
+
+
 class CPACodexKeeper:
-    def __init__(self, settings: Settings, dry_run: bool = False):
+    PAUSE_MESSAGES = {
+        ("full", "log"): "主巡检因日志巡检等待而暂停",
+        ("full", "timer"): "主巡检因定时复查等待而暂停",
+        ("log", "timer"): "日志巡检因定时复查等待而暂停",
+    }
+    def __init__(self, settings: Settings, dry_run: bool = False, coordinator: PriorityCoordinator | None = None):
         self.settings = settings
         self.dry_run = dry_run
+        self.coordinator = coordinator or PriorityCoordinator()
         self.logger = ConsoleLogger()
         self.cpa_client = CPAClient(
             settings.cpa_endpoint,
@@ -174,6 +245,30 @@ class CPACodexKeeper:
         except (TypeError, ValueError, OSError, OverflowError):
             return str(ts)
 
+    def _acquire_priority(self, priority):
+        self.coordinator.request(priority)
+        blocking = getattr(self.coordinator, "blocking_priority", lambda _priority: None)(priority)
+        pause_message = self.PAUSE_MESSAGES.get((priority, blocking))
+        if pause_message:
+            self.log("INFO", pause_message)
+        self.coordinator.acquire_next(priority)
+        if priority == "timer":
+            self.log("INFO", "定时复查已获取最高优先级")
+
+    def _release_priority(self, priority):
+        self.coordinator.release(priority)
+        has_pending = getattr(self.coordinator, "has_pending", None)
+        has_active = getattr(self.coordinator, "has_active", None)
+        has_lower_work = getattr(self.coordinator, "has_lower_work", None)
+        if (
+            priority == "timer"
+            and (has_pending is None or not has_pending(priority))
+            and (has_active is None or not has_active(priority))
+            and has_lower_work is not None
+            and has_lower_work(priority)
+        ):
+            self.log("INFO", "定时复查队列已清空，恢复较低优先级任务")
+
     def _set_tracked_next_check_at(self, name, ts):
         ts_int = int(ts)
         with self._state_lock:
@@ -194,13 +289,16 @@ class CPACodexKeeper:
                 self._tracked_recheck_timers.pop(name, None)
                 return
         self._tracked_recheck_timers.pop(name, None)
-        self.logger.emit_lines([
-            f"{self.logger.PREFIX_MAP['INFO']} 账号 {name} 到达计划复查时间，开始复查使用额度"
-        ])
+        self._acquire_priority("timer")
         try:
+            self.logger.emit_lines([
+                f"{self.logger.PREFIX_MAP['INFO']} 账号 {name} 到达计划复查时间，开始复查使用额度"
+            ])
             self.process_token({"name": name}, 1, 1)
         except Exception as exc:
             self.log("ERROR", f"账号 {name} 定时复查异常: {exc}")
+        finally:
+            self._release_priority("timer")
 
     def _collect_threshold_reaching_reset_ats(self, body_info):
         reached_reset_ats = []
@@ -731,6 +829,35 @@ class CPACodexKeeper:
         lines.append("=" * 60)
         self.logger.emit_lines(lines)
 
+    def _process_tokens_with_priority(self, tokens):
+        total = len(tokens)
+        token_iter = iter(enumerate(tokens, 1))
+        token_iter_lock = threading.Lock()
+
+        def worker():
+            while True:
+                with token_iter_lock:
+                    try:
+                        idx, token_info = next(token_iter)
+                    except StopIteration:
+                        return
+                self._acquire_priority("full")
+                try:
+                    try:
+                        self.process_token(token_info, idx, total)
+                    except Exception as exc:
+                        token_name = token_info.get("name", "unknown")
+                        self.log("ERROR", f"Token 任务异常 ({token_name}): {exc}", indent=1)
+                        self.blank_line()
+                finally:
+                    self._release_priority("full")
+
+        with ThreadPoolExecutor(max_workers=self.settings.worker_threads) as executor:
+            worker_count = min(total, self.settings.worker_threads)
+            futures = [executor.submit(worker) for _ in range(worker_count)]
+            for future in as_completed(futures):
+                future.result()
+
     def run(self):
         self.reset_stats()
         self.log_startup()
@@ -747,19 +874,7 @@ class CPACodexKeeper:
         self.log("INFO", f"线程数: {self.settings.worker_threads}")
         self.blank_line()
 
-        future_map = {}
-        with ThreadPoolExecutor(max_workers=self.settings.worker_threads) as executor:
-            for idx, token_info in enumerate(tokens, 1):
-                future = executor.submit(self.process_token, token_info, idx, total)
-                future_map[future] = token_info
-
-            for future in as_completed(future_map):
-                try:
-                    future.result()
-                except Exception as exc:
-                    token_name = future_map[future].get("name", "unknown")
-                    self.log("ERROR", f"Token 任务异常 ({token_name}): {exc}", indent=1)
-                    self.blank_line()
+        self._process_tokens_with_priority(tokens)
 
         elapsed = time.time() - start_time
         stats = self._stats_snapshot()
@@ -821,7 +936,11 @@ class CPACodexKeeper:
             self.reset_stats()
             self._set_total(total)
             for idx, token_info in enumerate(matched_tokens, 1):
-                self.process_fill_token(token_info, idx, total)
+                self._acquire_priority("log")
+                try:
+                    self.process_fill_token(token_info, idx, total)
+                finally:
+                    self._release_priority("log")
 
         self.last_usage_query_time = query_started_at
         return "processed"
