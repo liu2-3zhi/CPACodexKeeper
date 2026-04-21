@@ -940,7 +940,7 @@ class CPACodexKeeper:
             self.logger.format_log_record("INFO", "=" * 60),
             self.logger.format_log_record("INFO", "执行总结"),
             self.logger.format_log_record("INFO", f"总耗时: {elapsed:.1f} 秒", indent=1),
-            self.logger.format_log_record("INFO", f"Token 总数: {stats['total']}", indent=1),
+            self.logger.format_log_record("INFO", f"账号总数: {stats['total']}", indent=1),
             self.logger.format_log_record("INFO", f"工作线程: {self.settings.worker_threads}", indent=1),
             self.logger.format_log_record("INFO", "状态统计"),
             self.logger.format_log_record("OK", f"存活: {stats['alive']}", indent=1),
