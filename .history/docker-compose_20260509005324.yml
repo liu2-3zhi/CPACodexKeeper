@@ -1,0 +1,30 @@
+services:
+  cpacodexkeeper:
+    build: .
+    container_name: cpacodexkeeper
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CPA_ENDPOINT: ${CPA_ENDPOINT:-}
+      CPA_TOKEN: ${CPA_TOKEN:-}
+      CPA_PROXY: ${CPA_PROXY:-}
+      CPA_INTERVAL: ${CPA_INTERVAL:-1800}
+      CPA_QUOTA_THRESHOLD: ${CPA_QUOTA_THRESHOLD:-100}
+      CPA_USAGE_QUERY_INTERVAL: ${CPA_USAGE_QUERY_INTERVAL:-0}
+      CPA_QUOTA_RESET_NONE_RECHECK_SECONDS: ${CPA_QUOTA_RESET_NONE_RECHECK_SECONDS:-1800}
+      CPA_EXPIRY_THRESHOLD_DAYS: ${CPA_EXPIRY_THRESHOLD_DAYS:-3}
+      CPA_ENABLE_REFRESH: ${CPA_ENABLE_REFRESH:-true}
+      CPA_FORCE_REFRESH_ON_EXPIRY: ${CPA_FORCE_REFRESH_ON_EXPIRY:-false}
+      CPA_ALLOW_DELETE: ${CPA_ALLOW_DELETE:-true}
+      CPA_HTTP_TIMEOUT: ${CPA_HTTP_TIMEOUT:-30}
+      CPA_USAGE_TIMEOUT: ${CPA_USAGE_TIMEOUT:-15}
+      CPA_MAX_RETRIES: ${CPA_MAX_RETRIES:-2}
+      CPA_WORKER_THREADS: ${CPA_WORKER_THREADS:-8}
+      CPA_LOG_ARCHIVE_MAX_SIZE_MB: ${CPA_LOG_ARCHIVE_MAX_SIZE_MB:-500}
+      CPA_DISABLED_STATE_LOCK_TIMEOUT_SECONDS: ${CPA_DISABLED_STATE_LOCK_TIMEOUT_SECONDS:-10}
+      CPA_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS: ${CPA_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS:-0.2}
+    volumes:
+      - ./disabled_accounts.json.lock:/app/disabled_accounts.json.lock
+      - ./disabled_accounts.json:/app/disabled_accounts.json
+      - ./delete_blocked_accounts.json:/app/delete_blocked_accounts.json

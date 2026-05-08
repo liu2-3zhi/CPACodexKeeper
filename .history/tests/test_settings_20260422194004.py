@@ -1,0 +1,201 @@
+import os
+import pathlib
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from src.settings import SettingsError, load_settings
+
+
+class SettingsTests(unittest.TestCase):
+    def _make_env_file(self, content: str) -> Path:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        env_path = Path(temp_dir.name) / ".env"
+        env_path.write_text(content, encoding="utf-8")
+        return env_path
+
+    def test_load_settings_reads_required_values(self):
+        with patch.dict(os.environ, {"CPA_ENDPOINT": "https://example.com", "CPA_TOKEN": "secret"}, clear=True):
+            settings = load_settings()
+        self.assertEqual(settings.cpa_endpoint, "https://example.com")
+        self.assertEqual(settings.cpa_token, "secret")
+        self.assertEqual(settings.interval_seconds, 1800)
+        self.assertEqual(settings.worker_threads, 8)
+        self.assertTrue(settings.enable_refresh)
+
+    def test_load_settings_reads_from_project_env_file(self):
+        env_file = self._make_env_file("CPA_ENDPOINT=https://env-file.example.com\nCPA_TOKEN=file-secret\nCPA_INTERVAL=120\nCPA_WORKER_THREADS=6\n")
+        with patch.dict(os.environ, {}, clear=True):
+            settings = load_settings(env_file=env_file)
+        self.assertEqual(settings.cpa_endpoint, "https://env-file.example.com")
+        self.assertEqual(settings.cpa_token, "file-secret")
+        self.assertEqual(settings.interval_seconds, 120)
+        self.assertEqual(settings.worker_threads, 6)
+
+    def test_environment_variables_override_project_env_file(self):
+        env_file = self._make_env_file("CPA_ENDPOINT=https://env-file.example.com\nCPA_TOKEN=file-secret\nCPA_WORKER_THREADS=4\n")
+        with patch.dict(os.environ, {"CPA_ENDPOINT": "https://shell.example.com", "CPA_TOKEN": "shell-secret", "CPA_WORKER_THREADS": "12"}, clear=True):
+            settings = load_settings(env_file=env_file)
+        self.assertEqual(settings.cpa_endpoint, "https://shell.example.com")
+        self.assertEqual(settings.cpa_token, "shell-secret")
+        self.assertEqual(settings.worker_threads, 12)
+
+    def test_load_settings_rejects_missing_endpoint(self):
+        env_file = Path("does-not-exist.env")
+        with patch.dict(os.environ, {"CPA_TOKEN": "secret"}, clear=True):
+            with self.assertRaises(SettingsError):
+                load_settings(env_file=env_file)
+
+    def test_load_settings_rejects_bad_integer(self):
+        env_file = Path("does-not-exist.env")
+        with patch.dict(os.environ, {"CPA_ENDPOINT": "https://example.com", "CPA_TOKEN": "secret", "CPA_INTERVAL": "abc"}, clear=True):
+            with self.assertRaises(SettingsError):
+                load_settings(env_file=env_file)
+
+    def test_load_settings_rejects_non_integer_worker_threads(self):
+        env_file = Path("does-not-exist.env")
+        with patch.dict(os.environ, {"CPA_ENDPOINT": "https://example.com", "CPA_TOKEN": "secret", "CPA_WORKER_THREADS": "abc"}, clear=True):
+            with self.assertRaises(SettingsError):
+                load_settings(env_file=env_file)
+
+    def test_load_settings_reads_usage_query_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_USAGE_QUERY_INTERVAL": "7200",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.usage_query_interval_seconds, 7200)
+
+    def test_load_settings_reads_log_archive_max_size_mb(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_LOG_ARCHIVE_MAX_SIZE_MB": "256",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.log_archive_max_size_mb, 256)
+
+    def test_load_settings_uses_default_log_archive_max_size_mb(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.log_archive_max_size_mb, 500)
+
+    def test_load_settings_reads_fill_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_FILL_INTERVAL": "10",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.fill_interval_seconds, 10)
+
+    def test_load_settings_allows_zero_usage_query_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_USAGE_QUERY_INTERVAL": "0",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.usage_query_interval_seconds, 0)
+
+    def test_load_settings_reads_allow_delete_false(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_ALLOW_DELETE": "false",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertFalse(settings.allow_delete)
+
+    def test_load_settings_uses_default_allow_delete(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertTrue(settings.allow_delete)
+
+    def test_load_settings_reads_force_refresh_on_expiry_true(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_FORCE_REFRESH_ON_EXPIRY": "true",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertTrue(settings.force_refresh_on_expiry)
+
+    def test_load_settings_uses_default_force_refresh_on_expiry_false(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertFalse(settings.force_refresh_on_expiry)
+
+    def test_load_settings_reads_state_dir(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_STATE_DIR": "runtime-state",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.state_dir, Path("runtime-state"))
