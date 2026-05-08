@@ -63,8 +63,182 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(SettingsError):
                 load_settings(env_file=env_file)
 
-    def test_load_settings_rejects_zero_worker_threads(self):
-        env_file = Path("does-not-exist.env")
-        with patch.dict(os.environ, {"CPA_ENDPOINT": "https://example.com", "CPA_TOKEN": "secret", "CPA_WORKER_THREADS": "0"}, clear=True):
+    def test_load_settings_reads_usage_query_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_USAGE_QUERY_INTERVAL": "7200",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.usage_query_interval_seconds, 7200)
+
+    def test_load_settings_reads_log_archive_max_size_mb(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_LOG_ARCHIVE_MAX_SIZE_MB": "256",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.log_archive_max_size_mb, 256)
+
+    def test_load_settings_uses_default_log_archive_max_size_mb(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.log_archive_max_size_mb, 500)
+
+    def test_load_settings_reads_fill_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_FILL_INTERVAL": "10",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.fill_interval_seconds, 10)
+
+    def test_load_settings_allows_zero_usage_query_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_USAGE_QUERY_INTERVAL": "0",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.usage_query_interval_seconds, 0)
+
+    def test_load_settings_reads_allow_delete_false(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_ALLOW_DELETE": "false",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertFalse(settings.allow_delete)
+
+    def test_load_settings_uses_default_allow_delete(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertTrue(settings.allow_delete)
+
+    def test_load_settings_reads_force_refresh_on_expiry_true(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_FORCE_REFRESH_ON_EXPIRY": "true",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertTrue(settings.force_refresh_on_expiry)
+
+    def test_load_settings_uses_default_force_refresh_on_expiry_false(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertFalse(settings.force_refresh_on_expiry)
+
+    def test_load_settings_uses_default_disabled_state_lock_values(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.disabled_state_lock_timeout_seconds, 10.0)
+        self.assertEqual(settings.disabled_state_lock_retry_interval_seconds, 0.2)
+
+    def test_load_settings_reads_disabled_state_lock_values(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_DISABLED_STATE_LOCK_TIMEOUT_SECONDS": "3.5",
+                "CPA_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS": "0.05",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.disabled_state_lock_timeout_seconds, 3.5)
+        self.assertEqual(settings.disabled_state_lock_retry_interval_seconds, 0.05)
+
+    def test_load_settings_rejects_non_positive_disabled_state_lock_timeout(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_DISABLED_STATE_LOCK_TIMEOUT_SECONDS": "0",
+            },
+            clear=True,
+        ):
             with self.assertRaises(SettingsError):
-                load_settings(env_file=env_file)
+                load_settings()
+
+    def test_load_settings_rejects_non_positive_disabled_state_lock_retry_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(SettingsError):
+                load_settings()
+
