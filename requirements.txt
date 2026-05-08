@@ -1,1 +1,2 @@
 curl-cffi>=0.7.0
+filelock>=3.16.1

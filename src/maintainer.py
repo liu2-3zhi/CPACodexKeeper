@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from filelock import FileLock, Timeout as FileLockTimeout
+
 from .cpa_client import CPAClient
 from .logging_utils import ConsoleLogger, TokenLogger
 from .models import MaintainerStats, format_window_label
@@ -209,9 +211,45 @@ class CPACodexKeeper:
             return {}
         return data
 
-    def _save_disabled_accounts_state(self):
-        payload = json.dumps(self._tracked_disabled_accounts, ensure_ascii=False, indent=2, sort_keys=True)
-        self.disabled_accounts_path.write_text(payload + "\n", encoding="utf-8")
+    def _disabled_accounts_lock_path(self):
+        return Path(f"{self.disabled_accounts_path}.lock")
+
+    def _save_disabled_accounts_state(self, payload):
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        self.disabled_accounts_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.disabled_accounts_path.with_suffix(f"{self.disabled_accounts_path.suffix}.tmp")
+        tmp_path.write_text(serialized + "\n", encoding="utf-8")
+        tmp_path.replace(self.disabled_accounts_path)
+
+    def _locked_update_tracked_disabled_accounts(self, action_label, mutator):
+        lock = FileLock(str(self._disabled_accounts_lock_path()))
+        started_at = time.monotonic()
+        try:
+            with lock.acquire(
+                timeout=self.settings.disabled_state_lock_timeout_seconds,
+                poll_interval=self.settings.disabled_state_lock_retry_interval_seconds,
+            ):
+                waited_seconds = time.monotonic() - started_at
+                state = self._load_disabled_accounts_state()
+                mutator(state)
+                self._save_disabled_accounts_state(state)
+                with self._state_lock:
+                    self._tracked_disabled_accounts = state
+                if waited_seconds >= self.settings.disabled_state_lock_retry_interval_seconds:
+                    self.log("INFO", f"禁用账号计划锁已获取：{action_label}（等待 {waited_seconds:.2f} 秒）")
+                return True
+        except FileLockTimeout:
+            self.log(
+                "ERROR",
+                f"获取禁用账号计划锁超时：{action_label}（{self.settings.disabled_state_lock_timeout_seconds} 秒）",
+            )
+            return False
+
+    def _reload_tracked_disabled_accounts_state(self):
+        state = self._load_disabled_accounts_state()
+        with self._state_lock:
+            self._tracked_disabled_accounts = state
+        return state
 
     def _load_delete_blocked_history(self):
         if not self.delete_blocked_accounts_path.exists():
@@ -268,9 +306,8 @@ class CPACodexKeeper:
         with self._state_lock:
             if self._tracked_rechecks_started:
                 return
-            self._tracked_disabled_accounts = self._load_disabled_accounts_state()
             self._tracked_rechecks_started = True
-            tracked_entries = list(self._tracked_disabled_accounts.items())
+        tracked_entries = list(self._reload_tracked_disabled_accounts_state().items())
         for name, entry in tracked_entries:
             if not isinstance(entry, dict):
                 continue
@@ -318,24 +355,29 @@ class CPACodexKeeper:
 
     def _set_tracked_next_check_at(self, name, ts):
         ts_int = int(ts)
-        with self._state_lock:
-            self._tracked_disabled_accounts[name] = {"next_check_at": ts_int}
-            self._save_disabled_accounts_state()
-        self._schedule_tracked_recheck(name, ts_int)
+        success = self._locked_update_tracked_disabled_accounts(
+            f"记录 {name} 的下次复查时间",
+            lambda state: state.__setitem__(name, {"next_check_at": ts_int}),
+        )
+        if success:
+            self._schedule_tracked_recheck(name, ts_int)
+        return success
 
     def _remove_tracked_account(self, name):
-        with self._state_lock:
-            if name in self._tracked_disabled_accounts:
-                self._tracked_disabled_accounts.pop(name)
-                self._save_disabled_accounts_state()
-        self._cancel_tracked_recheck_timer(name)
+        success = self._locked_update_tracked_disabled_accounts(
+            f"移除 {name} 的复查计划",
+            lambda state: state.pop(name, None),
+        )
+        if success:
+            self._cancel_tracked_recheck_timer(name)
+        return success
 
     def _run_tracked_recheck(self, name):
-        with self._state_lock:
-            if name not in self._tracked_disabled_accounts:
-                self._tracked_recheck_timers.pop(name, None)
-                return
         self._tracked_recheck_timers.pop(name, None)
+        tracked_state = self._reload_tracked_disabled_accounts_state()
+        if name not in tracked_state:
+            self.log("INFO", f"账号 {name} 的复查计划已不存在，跳过本次定时复查")
+            return
         self._acquire_priority("timer")
         try:
             self.logger.emit_lines([
@@ -705,8 +747,10 @@ class CPACodexKeeper:
                         indent=1,
                     )
                 if self.set_disabled_status(name, disabled=False, logger=logger):
-                    self._remove_tracked_account(name)
-                    logger.log("ENABLE", "账号已重新启用", indent=1)
+                    if self._remove_tracked_account(name):
+                        logger.log("ENABLE", "账号已重新启用", indent=1)
+                    else:
+                        logger.log("ERROR", "账号已启用，但移除复查计划失败", indent=1)
                     self._inc_stat("enabled")
                     effective_disabled = False
                 else:
@@ -726,12 +770,14 @@ class CPACodexKeeper:
                     self.settings.interval_seconds,
                     token_detail=token_detail,
                 )
-                self._set_tracked_next_check_at(name, next_check_at)
-                logger.log(
-                    "INFO",
-                    f"已禁用，{reached_summary} >= {self.settings.quota_threshold}%，保持禁用并重排到 {self._format_tracked_next_check_at(next_check_at)}",
-                    indent=1,
-                )
+                if self._set_tracked_next_check_at(name, next_check_at):
+                    logger.log(
+                        "INFO",
+                        f"已禁用，{reached_summary} >= {self.settings.quota_threshold}%，保持禁用并重排到 {self._format_tracked_next_check_at(next_check_at)}",
+                        indent=1,
+                    )
+                else:
+                    logger.log("ERROR", "已禁用，但重排复查计划失败", indent=1)
                 return None, effective_disabled
             logger.log(
                 "INFO",
@@ -761,9 +807,11 @@ class CPACodexKeeper:
                     self.settings.quota_reset_none_recheck_seconds,
                     token_detail=token_detail,
                 )
-                self._set_tracked_next_check_at(name, next_check_at)
                 logger.log("DISABLE", "账号已禁用", indent=1)
-                logger.log("INFO", f"已记录下次检查额度时间: {self._format_tracked_next_check_at(next_check_at)}", indent=1)
+                if self._set_tracked_next_check_at(name, next_check_at):
+                    logger.log("INFO", f"已记录下次检查额度时间: {self._format_tracked_next_check_at(next_check_at)}", indent=1)
+                else:
+                    logger.log("ERROR", "账号已禁用，但记录复查计划失败", indent=1)
                 self._inc_stat("disabled")
             else:
                 logger.log("ERROR", "禁用失败", indent=1)

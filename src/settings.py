@@ -17,6 +17,8 @@ DEFAULT_ENABLE_REFRESH = True
 DEFAULT_ALLOW_DELETE = True
 DEFAULT_FORCE_REFRESH_ON_EXPIRY = False
 DEFAULT_LOG_ARCHIVE_MAX_SIZE_MB = 500   # 日志归档最大大小，单位为MB
+DEFAULT_DISABLED_STATE_LOCK_TIMEOUT_SECONDS = 10.0
+DEFAULT_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS = 0.2
 PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
@@ -43,6 +45,8 @@ class Settings:
     allow_delete: bool = DEFAULT_ALLOW_DELETE
     force_refresh_on_expiry: bool = DEFAULT_FORCE_REFRESH_ON_EXPIRY
     log_archive_max_size_mb: int = DEFAULT_LOG_ARCHIVE_MAX_SIZE_MB
+    disabled_state_lock_timeout_seconds: float = DEFAULT_DISABLED_STATE_LOCK_TIMEOUT_SECONDS
+    disabled_state_lock_retry_interval_seconds: float = DEFAULT_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS
 
 
 def _read_project_env_file(env_file: Path | None = None) -> dict[str, str]:
@@ -85,6 +89,19 @@ def _read_int(name: str, default: int, env_values: dict[str, str], *, minimum: i
         raise SettingsError(f"{name} must be >= {minimum}")
     if maximum is not None and value > maximum:
         raise SettingsError(f"{name} must be <= {maximum}")
+    return value
+
+
+def _read_float(name: str, default: float, env_values: dict[str, str], *, minimum: float = 0.0) -> float:
+    raw = _get_config_value(name, env_values)
+    if raw in (None, ""):
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SettingsError(f"{name} must be a number") from exc
+    if value <= minimum:
+        raise SettingsError(f"{name} must be > {minimum}")
     return value
 
 
@@ -149,5 +166,15 @@ def load_settings(env_file: Path | None = None) -> Settings:
             DEFAULT_LOG_ARCHIVE_MAX_SIZE_MB,
             env_values,
             minimum=1,
+        ),
+        disabled_state_lock_timeout_seconds=_read_float(
+            "CPA_DISABLED_STATE_LOCK_TIMEOUT_SECONDS",
+            DEFAULT_DISABLED_STATE_LOCK_TIMEOUT_SECONDS,
+            env_values,
+        ),
+        disabled_state_lock_retry_interval_seconds=_read_float(
+            "CPA_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS",
+            DEFAULT_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS,
+            env_values,
         ),
     )
