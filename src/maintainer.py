@@ -115,8 +115,12 @@ class CPACodexKeeper:
         self.stats = MaintainerStats()
         self._stats_lock = threading.Lock()
         self._state_lock = threading.Lock()
-        self.disabled_accounts_path = Path(__file__).resolve().parents[1] / "disabled_accounts.json"
-        self.delete_blocked_accounts_path = Path(__file__).resolve().parents[1] / "delete_blocked_accounts.json"
+        self.project_root = Path(__file__).resolve().parents[1]
+        self.state_dir_path = self.project_root / "state"
+        self.disabled_accounts_path = self.state_dir_path / "disabled_accounts.json"
+        self.delete_blocked_accounts_path = self.state_dir_path / "delete_blocked_accounts.json"
+        self.legacy_disabled_accounts_path = self.project_root / "disabled_accounts.json"
+        self.legacy_delete_blocked_accounts_path = self.project_root / "delete_blocked_accounts.json"
         self._tracked_disabled_accounts = self._load_disabled_accounts_state()
         self._tracked_recheck_timers: dict[str, threading.Timer] = {}
         self._tracked_rechecks_started = False
@@ -199,11 +203,22 @@ class CPACodexKeeper:
     def get_usage_log(self):
         return self.cpa_client.get_usage_log(lookback_seconds=self.settings.usage_query_interval_seconds)
 
+    def _read_json_file(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _existing_state_path(self, primary_path, legacy_path):
+        if primary_path.exists():
+            return primary_path
+        if legacy_path.exists():
+            return legacy_path
+        return primary_path
+
     def _load_disabled_accounts_state(self):
-        if not self.disabled_accounts_path.exists():
+        target_path = self._existing_state_path(self.disabled_accounts_path, self.legacy_disabled_accounts_path)
+        if not target_path.exists():
             return {}
         try:
-            data = json.loads(self.disabled_accounts_path.read_text(encoding="utf-8"))
+            data = self._read_json_file(target_path)
         except (OSError, json.JSONDecodeError) as exc:
             self.log("ERROR", f"加载禁用账号计划失败：{exc}")
             return {}
@@ -252,10 +267,14 @@ class CPACodexKeeper:
         return state
 
     def _load_delete_blocked_history(self):
-        if not self.delete_blocked_accounts_path.exists():
+        target_path = self._existing_state_path(
+            self.delete_blocked_accounts_path,
+            self.legacy_delete_blocked_accounts_path,
+        )
+        if not target_path.exists():
             return {"events": []}
         try:
-            data = json.loads(self.delete_blocked_accounts_path.read_text(encoding="utf-8"))
+            data = self._read_json_file(target_path)
         except (OSError, json.JSONDecodeError):
             return {"events": []}
         if not isinstance(data, dict):
@@ -266,6 +285,7 @@ class CPACodexKeeper:
         return {"events": events}
 
     def _save_delete_blocked_history(self, payload):
+        self.delete_blocked_accounts_path.parent.mkdir(parents=True, exist_ok=True)
         self.delete_blocked_accounts_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",

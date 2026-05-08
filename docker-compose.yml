@@ -6,6 +6,4 @@ services:
     env_file:
       - .env
     volumes:
-      - ./disabled_accounts.json.lock:/app/disabled_accounts.json.lock
-      - ./disabled_accounts.json:/app/disabled_accounts.json
-      - ./delete_blocked_accounts.json:/app/delete_blocked_accounts.json
+      - ./state:/app/state
