@@ -653,14 +653,17 @@ class MaintainerTests(unittest.TestCase):
     def test_process_token_enables_tracked_disabled_token_when_due_and_below_threshold(self):
         captured_lines = []
         self.maintainer.logger.emit_lines = Mock(side_effect=lambda lines: captured_lines.append(list(lines)))
-        self.maintainer.get_token_detail = Mock(return_value={
-            "email": "a@example.com",
-            "disabled": True,
-            "access_token": "token",
-            "refresh_token": "rt",
-            "account_id": "acc",
-            "expired": "2099-01-01T00:00:00Z",
-        })
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t-enable", "disabled": False},
+        ])
         self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
         self.maintainer.check_token_live = Mock(return_value=(200, {
             "json": {
@@ -674,7 +677,7 @@ class MaintainerTests(unittest.TestCase):
         }))
         self.maintainer.set_disabled_status = Mock(return_value=True)
 
-        with patch("src.maintainer.time.time", return_value=1000):
+        with patch("src.maintainer.time.time", return_value=1000), patch("src.maintainer.time.sleep"):
             result = self.maintainer.process_token({"name": "t-enable"}, 1, 1)
 
         self.assertEqual(result, "alive")
@@ -682,6 +685,115 @@ class MaintainerTests(unittest.TestCase):
         self.assertIsNone(self.maintainer._get_tracked_next_check_at("t-enable"))
         emitted = "\n".join(captured_lines[0])
         self.assertIn("账号已重新启用", emitted)
+
+    def test_process_token_retries_enable_until_verification_succeeds(self):
+        self.maintainer.settings.enable_verify_delay_seconds = 5
+        self.maintainer.settings.enable_verify_max_attempts = 3
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t-enable", "disabled": True},
+            {"name": "t-enable", "disabled": False},
+        ])
+        self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1776634820},
+                    "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 1777000096},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        with patch("src.maintainer.time.time", return_value=1000), patch("src.maintainer.time.sleep") as sleep_mock:
+            result = self.maintainer.process_token({"name": "t-enable"}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.assertEqual(self.maintainer.set_disabled_status.call_count, 2)
+        sleep_mock.assert_has_calls([call(5), call(5)])
+        self.assertIsNone(self.maintainer._get_tracked_next_check_at("t-enable"))
+        self.assertEqual(self.maintainer.stats.enabled, 1)
+
+    def test_process_token_keeps_tracked_state_when_enable_verification_never_succeeds(self):
+        self.maintainer.settings.enable_verify_delay_seconds = 5
+        self.maintainer.settings.enable_verify_max_attempts = 3
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t-enable", "disabled": True},
+            {"name": "t-enable", "disabled": True},
+            {"name": "t-enable", "disabled": True},
+        ])
+        self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1776634820},
+                    "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 1777000096},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        with patch("src.maintainer.time.time", return_value=1000), patch("src.maintainer.time.sleep"):
+            result = self.maintainer.process_token({"name": "t-enable"}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.assertEqual(self.maintainer.set_disabled_status.call_count, 3)
+        self.assertEqual(self.maintainer._get_tracked_next_check_at("t-enable"), 1000)
+        self.assertEqual(self.maintainer.stats.enabled, 0)
+
+    def test_process_token_retries_when_enable_verification_detail_fetch_fails(self):
+        self.maintainer.settings.enable_verify_delay_seconds = 5
+        self.maintainer.settings.enable_verify_max_attempts = 3
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            None,
+            {"name": "t-enable", "disabled": False},
+        ])
+        self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1776634820},
+                    "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 1777000096},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        with patch("src.maintainer.time.time", return_value=1000), patch("src.maintainer.time.sleep"):
+            result = self.maintainer.process_token({"name": "t-enable"}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.assertEqual(self.maintainer.set_disabled_status.call_count, 2)
+        self.assertEqual(self.maintainer.stats.enabled, 1)
 
     def test_run_tracked_recheck_requests_and_releases_timer_priority(self):
         coordinator = Mock()
@@ -767,14 +879,17 @@ class MaintainerTests(unittest.TestCase):
         self.maintainer.disabled_accounts_path = state_path
         self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
         self.maintainer.logger.emit_lines = Mock()
-        self.maintainer.get_token_detail = Mock(return_value={
-            "email": "a@example.com",
-            "disabled": True,
-            "access_token": "token",
-            "refresh_token": "rt",
-            "account_id": "acc",
-            "expired": "2099-01-01T00:00:00Z",
-        })
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t-enable", "disabled": False},
+        ])
         self.maintainer.check_token_live = Mock(return_value=(200, {
             "json": {
                 "plan_type": "team",
@@ -787,7 +902,7 @@ class MaintainerTests(unittest.TestCase):
         }))
         self.maintainer.set_disabled_status = Mock(return_value=True)
 
-        with patch("src.maintainer.time.time", return_value=1000):
+        with patch("src.maintainer.time.time", return_value=1000), patch("src.maintainer.time.sleep"):
             self.maintainer._run_tracked_recheck("t-enable")
 
         self.maintainer.set_disabled_status.assert_called_once_with("t-enable", disabled=False, logger=ANY)

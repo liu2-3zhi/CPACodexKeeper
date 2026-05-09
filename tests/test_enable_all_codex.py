@@ -2,7 +2,7 @@ import io
 import pathlib
 import sys
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -99,16 +99,77 @@ class EnableAllCodexTests(unittest.TestCase):
     def test_enable_accounts_enables_disabled_codex_accounts(self):
         client = Mock()
         client.set_disabled.return_value = True
+        client.get_auth_file.return_value = {"name": "token-a", "disabled": False}
         accounts = [
             {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
         ]
 
-        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+        with patch("enable_all_codex.time.sleep") as sleep_mock, patch("sys.stdout", new_callable=io.StringIO) as stdout:
             exit_code = enable_all_codex.enable_accounts(client, accounts)
 
         self.assertEqual(exit_code, 0)
         client.set_disabled.assert_called_once_with("token-a", False)
+        client.get_auth_file.assert_called_once_with("token-a")
+        sleep_mock.assert_called_once_with(5)
         self.assertIn("启用成功", stdout.getvalue())
+
+    def test_enable_accounts_retries_until_verification_succeeds(self):
+        client = Mock()
+        client.set_disabled.side_effect = [True, True]
+        client.get_auth_file.side_effect = [
+            {"name": "token-a", "disabled": True},
+            {"name": "token-a", "disabled": False},
+        ]
+        accounts = [
+            {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
+        ]
+
+        with patch("enable_all_codex.time.sleep") as sleep_mock, patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = enable_all_codex.enable_accounts(client, accounts)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(client.set_disabled.call_count, 2)
+        self.assertEqual(client.get_auth_file.call_count, 2)
+        sleep_mock.assert_has_calls([call(5), call(5)])
+        self.assertIn("启用成功", stdout.getvalue())
+
+    def test_enable_accounts_reports_manual_check_after_max_attempts(self):
+        client = Mock()
+        client.set_disabled.side_effect = [True, True, True, True]
+        client.get_auth_file.side_effect = [
+            {"name": "token-a", "disabled": True},
+            {"name": "token-a", "disabled": True},
+            {"name": "token-a", "disabled": True},
+            {"name": "token-b", "disabled": False},
+        ]
+        accounts = [
+            {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
+            {"name": "token-b", "type": "codex", "email": "b@example.com", "disabled": True},
+        ]
+
+        with patch("enable_all_codex.time.sleep"), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = enable_all_codex.enable_accounts(client, accounts)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(client.set_disabled.call_count, 4)
+        self.assertIn("失败账号: token-a", stdout.getvalue())
+        self.assertIn("经过 3 次启用确认仍失败，请人工检查", stdout.getvalue())
+        self.assertIn("token-b", stdout.getvalue())
+
+    def test_enable_accounts_retries_after_verification_fetch_failure(self):
+        client = Mock()
+        client.set_disabled.side_effect = [True, True]
+        client.get_auth_file.side_effect = [None, {"name": "token-a", "disabled": False}]
+        accounts = [
+            {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
+        ]
+
+        with patch("enable_all_codex.time.sleep"), patch("sys.stdout", new_callable=io.StringIO):
+            exit_code = enable_all_codex.enable_accounts(client, accounts)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(client.set_disabled.call_count, 2)
+        self.assertEqual(client.get_auth_file.call_count, 2)
 
     def test_mask_secret_hides_plaintext_token(self):
         masked = enable_all_codex.mask_secret("1234567890abcdef")
@@ -145,22 +206,23 @@ class EnableAllCodexTests(unittest.TestCase):
 
     def test_enable_accounts_continues_after_one_failure(self):
         client = Mock()
-        client.set_disabled.side_effect = [False, True]
+        client.set_disabled.side_effect = [False, False, False, True]
+        client.get_auth_file.return_value = {"name": "token-b", "disabled": False}
         accounts = [
             {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
             {"name": "token-b", "type": "codex", "email": "b@example.com", "disabled": True},
         ]
 
-        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+        with patch("enable_all_codex.time.sleep"), patch("sys.stdout", new_callable=io.StringIO) as stdout:
             exit_code = enable_all_codex.enable_accounts(client, accounts)
 
         self.assertEqual(exit_code, 1)
-        self.assertEqual(client.set_disabled.call_count, 2)
+        self.assertEqual(client.set_disabled.call_count, 4)
         self.assertIn("token-a", stdout.getvalue())
         self.assertIn("token-b", stdout.getvalue())
-        self.assertIn("启用失败", stdout.getvalue())
         self.assertIn("启用成功", stdout.getvalue())
         self.assertIn("失败账号: token-a", stdout.getvalue())
+        self.assertIn("经过 3 次启用确认仍失败，请人工检查", stdout.getvalue())
 
     @patch("enable_all_codex.fetch_codex_accounts", return_value=(
         [{"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True}],
