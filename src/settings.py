@@ -19,6 +19,8 @@ DEFAULT_FORCE_REFRESH_ON_EXPIRY = False
 DEFAULT_LOG_ARCHIVE_MAX_SIZE_MB = 500   # 日志归档最大大小，单位为MB
 DEFAULT_DISABLED_STATE_LOCK_TIMEOUT_SECONDS = 10.0
 DEFAULT_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS = 0.2
+DEFAULT_ENABLE_VERIFY_DELAY_SECONDS = 5
+DEFAULT_ENABLE_VERIFY_MAX_ATTEMPTS = 3
 PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
@@ -47,6 +49,8 @@ class Settings:
     log_archive_max_size_mb: int = DEFAULT_LOG_ARCHIVE_MAX_SIZE_MB
     disabled_state_lock_timeout_seconds: float = DEFAULT_DISABLED_STATE_LOCK_TIMEOUT_SECONDS
     disabled_state_lock_retry_interval_seconds: float = DEFAULT_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS
+    enable_verify_delay_seconds: int = DEFAULT_ENABLE_VERIFY_DELAY_SECONDS
+    enable_verify_max_attempts: int = DEFAULT_ENABLE_VERIFY_MAX_ATTEMPTS
 
 
 def _read_project_env_file(env_file: Path | None = None) -> dict[str, str]:
@@ -176,5 +180,17 @@ def load_settings(env_file: Path | None = None) -> Settings:
             "CPA_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS",
             DEFAULT_DISABLED_STATE_LOCK_RETRY_INTERVAL_SECONDS,
             env_values,
+        ),
+        enable_verify_delay_seconds=_read_int(
+            "CPA_ENABLE_VERIFY_DELAY_SECONDS",
+            DEFAULT_ENABLE_VERIFY_DELAY_SECONDS,
+            env_values,
+            minimum=1,
+        ),
+        enable_verify_max_attempts=_read_int(
+            "CPA_ENABLE_VERIFY_MAX_ATTEMPTS",
+            DEFAULT_ENABLE_VERIFY_MAX_ATTEMPTS,
+            env_values,
+            minimum=1,
         ),
     )

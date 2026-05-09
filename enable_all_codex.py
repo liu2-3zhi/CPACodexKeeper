@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from getpass import getpass
 
@@ -17,6 +18,8 @@ DEFAULT_CPA_TOKEN = ""
 DEFAULT_CPA_PROXY = ""
 DEFAULT_CPA_TIMEOUT = 30
 DEFAULT_CPA_MAX_RETRIES = 2
+DEFAULT_ENABLE_VERIFY_DELAY_SECONDS = 5
+DEFAULT_ENABLE_VERIFY_MAX_ATTEMPTS = 3
 
 
 def log(level: str, message: str) -> None:
@@ -92,6 +95,32 @@ def fetch_codex_accounts(client: CPAClient) -> tuple[list[dict], int]:
     return accounts, len(files)
 
 
+def enable_account_with_verification(
+    client: CPAClient,
+    name: str,
+    *,
+    delay_seconds: int = DEFAULT_ENABLE_VERIFY_DELAY_SECONDS,
+    max_attempts: int = DEFAULT_ENABLE_VERIFY_MAX_ATTEMPTS,
+) -> tuple[bool, str | None]:
+    for attempt in range(1, max_attempts + 1):
+        log("INFO", f"第 {attempt}/{max_attempts} 次尝试启用账号 {name}")
+        if not client.set_disabled(name, False):
+            log("ERROR", "启用请求失败")
+            continue
+        log("INFO", f"等待 {delay_seconds} 秒后复查启用状态")
+        time.sleep(delay_seconds)
+        token_detail = client.get_auth_file(name)
+        if not token_detail:
+            log("ERROR", "复查账号详情失败")
+            continue
+        disabled = token_detail.get("disabled")
+        if disabled is False:
+            log("OK", "启用成功")
+            return True, None
+        log("WARN", f"复查发现账号仍为禁用状态: disabled={disabled}")
+    return False, f"经过 {max_attempts} 次启用确认仍失败，请人工检查"
+
+
 def enable_accounts(client: CPAClient, accounts: list[dict]) -> int:
     failures = 0
     already_enabled = 0
@@ -119,18 +148,22 @@ def enable_accounts(client: CPAClient, accounts: list[dict]) -> int:
             continue
 
         log("INFO", "开始设置 disabled=false")
-        if client.set_disabled(name, False):
+        ok, failure_reason = enable_account_with_verification(client, name)
+        if ok:
             enabled += 1
-            log("OK", "启用成功")
         else:
             failures += 1
             failed_names.append(name)
-            log("ERROR", "启用失败")
+            log("ERROR", failure_reason or "启用失败")
 
     attempted = enabled + failures - skipped_invalid
     log("INFO", f"汇总: 总处理={len(accounts)} 已启用={already_enabled} 尝试启用={attempted} 成功启用={enabled} 失败={failures} 无效={skipped_invalid}")
     if failed_names:
         log("ERROR", f"失败账号: {', '.join(failed_names)}")
+        log(
+            "ERROR",
+            f"以下账号经过 {DEFAULT_ENABLE_VERIFY_MAX_ATTEMPTS} 次启用确认仍失败，请人工检查: {', '.join(failed_names)}",
+        )
     return 1 if failures else 0
 
 

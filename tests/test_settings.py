@@ -77,6 +77,62 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.usage_query_interval_seconds, 7200)
 
+    def test_load_settings_uses_default_enable_verify_values(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.enable_verify_delay_seconds, 5)
+        self.assertEqual(settings.enable_verify_max_attempts, 3)
+
+    def test_load_settings_reads_enable_verify_values(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_ENABLE_VERIFY_DELAY_SECONDS": "7",
+                "CPA_ENABLE_VERIFY_MAX_ATTEMPTS": "4",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.enable_verify_delay_seconds, 7)
+        self.assertEqual(settings.enable_verify_max_attempts, 4)
+
+    def test_load_settings_rejects_non_positive_enable_verify_delay(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_ENABLE_VERIFY_DELAY_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(SettingsError):
+                load_settings()
+
+    def test_load_settings_rejects_non_positive_enable_verify_max_attempts(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_ENABLE_VERIFY_MAX_ATTEMPTS": "0",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(SettingsError):
+                load_settings()
+
     def test_load_settings_reads_log_archive_max_size_mb(self):
         with patch.dict(
             os.environ,

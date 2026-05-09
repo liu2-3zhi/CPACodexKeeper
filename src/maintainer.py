@@ -173,6 +173,34 @@ class CPACodexKeeper:
             return True
         return self.cpa_client.set_disabled(name, disabled)
 
+    def _enable_with_verification(self, name, logger):
+        delay_seconds = self.settings.enable_verify_delay_seconds
+        max_attempts = self.settings.enable_verify_max_attempts
+        for attempt in range(1, max_attempts + 1):
+            logger.log("INFO", f"第 {attempt}/{max_attempts} 次尝试启用账号", indent=1)
+            if not self.set_disabled_status(name, disabled=False, logger=logger):
+                logger.log("ERROR", "启用请求失败", indent=1)
+                if attempt < max_attempts:
+                    logger.log("WARN", "准备重试启用", indent=1)
+                continue
+            logger.log("INFO", f"等待 {delay_seconds} 秒后复查启用状态", indent=1)
+            time.sleep(delay_seconds)
+            token_detail = self.get_token_detail(name)
+            if not token_detail:
+                logger.log("ERROR", "复查账号详情失败", indent=1)
+                if attempt < max_attempts:
+                    logger.log("WARN", "无法确认启用状态，准备重试", indent=1)
+                continue
+            disabled = token_detail.get("disabled")
+            if disabled is False:
+                logger.log("ENABLE", "复查确认账号已启用", indent=1)
+                return True
+            logger.log("WARN", f"复查发现账号仍为禁用状态: disabled={disabled}", indent=1)
+            if attempt < max_attempts:
+                logger.log("WARN", "准备再次发送启用请求", indent=1)
+        logger.log("ERROR", f"账号启用复查失败，已达到最大尝试次数 {max_attempts}", indent=1)
+        return False
+
     def check_token_live(self, access_token, account_id=None):
         if not access_token:
             return None, "missing access_token"
@@ -766,15 +794,15 @@ class CPACodexKeeper:
                         f"已禁用但{primary_label}额度已降至 {primary_pct}% < {self.settings.quota_threshold}%，准备启用",
                         indent=1,
                     )
-                if self.set_disabled_status(name, disabled=False, logger=logger):
+                if self._enable_with_verification(name, logger):
                     if self._remove_tracked_account(name):
                         logger.log("ENABLE", "账号已重新启用", indent=1)
                     else:
-                        logger.log("ERROR", "账号已启用，但移除复查计划失败", indent=1)
+                        logger.log("ERROR", "账号已确认启用，但移除复查计划失败", indent=1)
                     self._inc_stat("enabled")
                     effective_disabled = False
                 else:
-                    logger.log("ERROR", "启用失败", indent=1)
+                    logger.log("ERROR", "账号启用未确认成功，保留待下次处理状态", indent=1)
                 return None, effective_disabled
             if not has_refresh_token and (primary_reached or secondary_reached):
                 return self._delete_token_with_reason(
