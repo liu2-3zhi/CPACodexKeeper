@@ -9,6 +9,31 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import enable_all_codex
 
 
+class FakeFuture:
+    def __init__(self, result):
+        self._result = result
+
+    def result(self):
+        return self._result
+
+
+class FakeExecutor:
+    def __init__(self, max_workers):
+        self.max_workers = max_workers
+        self.submitted = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def submit(self, fn, *args, **kwargs):
+        future = FakeFuture(fn(*args, **kwargs))
+        self.submitted.append((fn, args, kwargs, future))
+        return future
+
+
 class EnableAllCodexTests(unittest.TestCase):
     def test_resolve_config_uses_built_in_values_without_prompting(self):
         with patch.object(enable_all_codex, "DEFAULT_CPA_ENDPOINT", "https://built-in.example.com"), \
@@ -170,6 +195,108 @@ class EnableAllCodexTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(client.set_disabled.call_count, 2)
         self.assertEqual(client.get_auth_file.call_count, 2)
+
+    @patch("enable_all_codex.as_completed", side_effect=lambda futures: list(futures))
+    def test_enable_accounts_processes_disabled_accounts_with_thread_pool(self, _as_completed_mock):
+        client = Mock()
+        accounts = [
+            {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
+            {"name": "token-b", "type": "codex", "email": "b@example.com", "disabled": True},
+        ]
+        fake_executor = FakeExecutor(enable_all_codex.DEFAULT_ENABLE_CONCURRENCY)
+
+        with patch("enable_all_codex.ThreadPoolExecutor", side_effect=lambda max_workers: fake_executor), \
+             patch("enable_all_codex.process_account", side_effect=[
+                 enable_all_codex.AccountProcessResult(
+                     name="token-a",
+                     success=True,
+                     already_enabled=False,
+                     invalid=False,
+                     failure_reason=None,
+                     log_lines=["[1/2] token-a", "token-a ok"],
+                 ),
+                 enable_all_codex.AccountProcessResult(
+                     name="token-b",
+                     success=True,
+                     already_enabled=False,
+                     invalid=False,
+                     failure_reason=None,
+                     log_lines=["[2/2] token-b", "token-b ok"],
+                 ),
+             ]) as process_mock, \
+             patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = enable_all_codex.enable_accounts(client, accounts)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(fake_executor.max_workers, enable_all_codex.DEFAULT_ENABLE_CONCURRENCY)
+        self.assertEqual(len(fake_executor.submitted), 2)
+        self.assertEqual(process_mock.call_count, 2)
+        self.assertIn("token-a ok", stdout.getvalue())
+        self.assertIn("token-b ok", stdout.getvalue())
+
+    @patch("enable_all_codex.as_completed", side_effect=lambda futures: list(reversed(list(futures))))
+    def test_enable_accounts_prints_each_account_logs_as_a_block(self, _as_completed_mock):
+        client = Mock()
+        accounts = [
+            {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
+            {"name": "token-b", "type": "codex", "email": "b@example.com", "disabled": True},
+        ]
+        fake_executor = FakeExecutor(enable_all_codex.DEFAULT_ENABLE_CONCURRENCY)
+
+        with patch("enable_all_codex.ThreadPoolExecutor", side_effect=lambda max_workers: fake_executor), \
+             patch("enable_all_codex.process_account", side_effect=[
+                 enable_all_codex.AccountProcessResult(
+                     name="token-a",
+                     success=True,
+                     already_enabled=False,
+                     invalid=False,
+                     failure_reason=None,
+                     log_lines=["A-1", "A-2"],
+                 ),
+                 enable_all_codex.AccountProcessResult(
+                     name="token-b",
+                     success=True,
+                     already_enabled=False,
+                     invalid=False,
+                     failure_reason=None,
+                     log_lines=["B-1", "B-2"],
+                 ),
+             ]), \
+             patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            enable_all_codex.enable_accounts(client, accounts)
+
+        suffixes = [
+            line.rsplit(": ", 1)[1] if ": " in line else line
+            for line in stdout.getvalue().splitlines()
+            if (line.rsplit(": ", 1)[-1] if ": " in line else line) in {"A-1", "A-2", "B-1", "B-2"}
+        ]
+        self.assertEqual(suffixes, ["B-1", "B-2", "A-1", "A-2"])
+
+    def test_process_account_returns_failure_result_for_missing_name(self):
+        client = Mock()
+
+        result = enable_all_codex.process_account(client, {"email": "missing@example.com", "disabled": True}, 3, 10)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.invalid)
+        self.assertEqual(result.name, "<missing-name>")
+        self.assertEqual(result.failure_reason, "缺少账号 name")
+        self.assertTrue(any("缺少账号 name，跳过" in line for line in result.log_lines))
+
+    def test_process_account_returns_already_enabled_result_without_submitting_enable(self):
+        client = Mock()
+
+        result = enable_all_codex.process_account(
+            client,
+            {"name": "token-a", "email": "a@example.com", "disabled": False},
+            1,
+            5,
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.already_enabled)
+        client.set_disabled.assert_not_called()
+        self.assertTrue(any("已是启用状态，跳过" in line for line in result.log_lines))
 
     def test_mask_secret_hides_plaintext_token(self):
         masked = enable_all_codex.mask_secret("1234567890abcdef")
