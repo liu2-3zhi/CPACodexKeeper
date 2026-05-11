@@ -8,7 +8,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from src.cpa_client import CPAClient
 
-SERIALIZATION_TIMEOUT = 0.1
+SECOND_REQUEST_WAIT_TIMEOUT_SECONDS = 0.1
 
 
 class CPAClientTests(unittest.TestCase):
@@ -89,7 +89,7 @@ class CPAClientTests(unittest.TestCase):
         t1.start()
         first_started.wait(timeout=1)
         t2.start()
-        self.assertFalse(second_started.wait(timeout=SERIALIZATION_TIMEOUT))
+        self.assertFalse(second_started.wait(timeout=SECOND_REQUEST_WAIT_TIMEOUT_SECONDS))
         release_first.set()
         t1.join()
         t2.join()
