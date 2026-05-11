@@ -8,6 +8,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from src.cpa_client import CPAClient
 
+THREAD_BLOCKING_VERIFICATION_TIMEOUT = 0.1
+
 
 class CPAClientTests(unittest.TestCase):
     def test_upload_auth_file_passes_name_via_params(self):
@@ -87,7 +89,7 @@ class CPAClientTests(unittest.TestCase):
         t1.start()
         first_started.wait(timeout=1)
         t2.start()
-        self.assertFalse(second_started.wait(timeout=0.1))
+        self.assertFalse(second_started.wait(timeout=THREAD_BLOCKING_VERIFICATION_TIMEOUT))
         release_first.set()
         t1.join()
         t2.join()
