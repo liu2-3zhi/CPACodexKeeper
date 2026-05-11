@@ -1,7 +1,6 @@
 import pathlib
 import sys
 import threading
-import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -55,6 +54,7 @@ class CPAClientTests(unittest.TestCase):
         call_order: list[str] = []
         release_first = threading.Event()
         first_started = threading.Event()
+        second_started = threading.Event()
 
         def side_effect(*args, **kwargs):
             label = kwargs["params"]["name"]
@@ -63,6 +63,8 @@ class CPAClientTests(unittest.TestCase):
             if label == "first":
                 first_started.set()
                 release_first.wait(timeout=2)
+            else:
+                second_started.set()
             with order_lock:
                 call_order.append(f"{label}-end")
             response = Mock()
@@ -85,7 +87,7 @@ class CPAClientTests(unittest.TestCase):
         t1.start()
         first_started.wait(timeout=1)
         t2.start()
-        time.sleep(0.05)
+        self.assertFalse(second_started.wait(timeout=0.1))
         release_first.set()
         t1.join()
         t2.join()
