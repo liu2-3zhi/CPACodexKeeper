@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from typing import Any
 
@@ -13,6 +14,7 @@ class CPAClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self._request_lock = threading.Lock()
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.headers = {
             "Authorization": f"Bearer {token}",
@@ -22,36 +24,37 @@ class CPAClient:
 
     def _request(self, method: str, path: str, **kwargs) -> RequestResult:
         last_error = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = requests.request(
-                    method=method,
-                    url=f"{self.base_url}{path}",
-                    headers=self.headers,
-                    proxies=self.proxies,
-                    impersonate="chrome",
-                    timeout=self.timeout,
-                    **kwargs,
-                )
-                json_data = None
+        with self._request_lock:
+            for attempt in range(self.max_retries + 1):
                 try:
-                    json_data = response.json()
-                except (ValueError, TypeError):
-                    pass
-                if response.status_code >= 500 and attempt < self.max_retries:
-                    time.sleep(1)
-                    continue
-                return RequestResult(
-                    status_code=response.status_code,
-                    body=response.text,
-                    brief=brief_response_text(response),
-                    json_data=json_data,
-                )
-            except Exception as exc:
-                last_error = str(exc)
-                if attempt < self.max_retries:
-                    time.sleep(1)
-                    continue
+                    response = requests.request(
+                        method=method,
+                        url=f"{self.base_url}{path}",
+                        headers=self.headers,
+                        proxies=self.proxies,
+                        impersonate="chrome",
+                        timeout=self.timeout,
+                        **kwargs,
+                    )
+                    json_data = None
+                    try:
+                        json_data = response.json()
+                    except (ValueError, TypeError):
+                        pass
+                    if response.status_code >= 500 and attempt < self.max_retries:
+                        time.sleep(1)
+                        continue
+                    return RequestResult(
+                        status_code=response.status_code,
+                        body=response.text,
+                        brief=brief_response_text(response),
+                        json_data=json_data,
+                    )
+                except Exception as exc:
+                    last_error = str(exc)
+                    if attempt < self.max_retries:
+                        time.sleep(1)
+                        continue
         return RequestResult(status_code=None, error=last_error or "request failed")
 
     def list_auth_files(self) -> list[dict[str, Any]]:
