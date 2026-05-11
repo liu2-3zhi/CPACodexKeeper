@@ -9,31 +9,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import enable_all_codex
 
 
-class FakeFuture:
-    def __init__(self, result):
-        self._result = result
-
-    def result(self):
-        return self._result
-
-
-class FakeExecutor:
-    def __init__(self, max_workers):
-        self.max_workers = max_workers
-        self.submitted = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def submit(self, fn, *args, **kwargs):
-        future = FakeFuture(fn(*args, **kwargs))
-        self.submitted.append((fn, args, kwargs, future))
-        return future
-
-
 class EnableAllCodexTests(unittest.TestCase):
     def test_resolve_config_uses_built_in_values_without_prompting(self):
         with patch.object(enable_all_codex, "DEFAULT_CPA_ENDPOINT", "https://built-in.example.com"), \
@@ -196,17 +171,13 @@ class EnableAllCodexTests(unittest.TestCase):
         self.assertEqual(client.set_disabled.call_count, 2)
         self.assertEqual(client.get_auth_file.call_count, 2)
 
-    @patch("enable_all_codex.as_completed", side_effect=lambda futures: list(futures))
-    def test_enable_accounts_processes_disabled_accounts_with_thread_pool(self, _as_completed_mock):
+    def test_enable_accounts_processes_disabled_accounts_with_queue(self):
         client = Mock()
         accounts = [
             {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
             {"name": "token-b", "type": "codex", "email": "b@example.com", "disabled": True},
         ]
-        fake_executor = FakeExecutor(enable_all_codex.DEFAULT_ENABLE_CONCURRENCY)
-
-        with patch("enable_all_codex.ThreadPoolExecutor", side_effect=lambda max_workers: fake_executor), \
-             patch("enable_all_codex.process_account", side_effect=[
+        with patch("enable_all_codex.process_account", side_effect=[
                  enable_all_codex.AccountProcessResult(
                      name="token-a",
                      success=True,
@@ -228,23 +199,24 @@ class EnableAllCodexTests(unittest.TestCase):
             exit_code = enable_all_codex.enable_accounts(client, accounts)
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(fake_executor.max_workers, enable_all_codex.DEFAULT_ENABLE_CONCURRENCY)
-        self.assertEqual(len(fake_executor.submitted), 2)
         self.assertEqual(process_mock.call_count, 2)
+        self.assertEqual(
+            process_mock.call_args_list,
+            [
+                call(client, accounts[0], 1, 2),
+                call(client, accounts[1], 2, 2),
+            ],
+        )
         self.assertIn("token-a ok", stdout.getvalue())
         self.assertIn("token-b ok", stdout.getvalue())
 
-    @patch("enable_all_codex.as_completed", side_effect=lambda futures: list(reversed(list(futures))))
-    def test_enable_accounts_prints_each_account_logs_as_a_block(self, _as_completed_mock):
+    def test_enable_accounts_prints_each_account_logs_as_a_block(self):
         client = Mock()
         accounts = [
             {"name": "token-a", "type": "codex", "email": "a@example.com", "disabled": True},
             {"name": "token-b", "type": "codex", "email": "b@example.com", "disabled": True},
         ]
-        fake_executor = FakeExecutor(enable_all_codex.DEFAULT_ENABLE_CONCURRENCY)
-
-        with patch("enable_all_codex.ThreadPoolExecutor", side_effect=lambda max_workers: fake_executor), \
-             patch("enable_all_codex.process_account", side_effect=[
+        with patch("enable_all_codex.process_account", side_effect=[
                  enable_all_codex.AccountProcessResult(
                      name="token-a",
                      success=True,
@@ -270,7 +242,7 @@ class EnableAllCodexTests(unittest.TestCase):
             for line in stdout.getvalue().splitlines()
             if (line.rsplit(": ", 1)[-1] if ": " in line else line) in {"A-1", "A-2", "B-1", "B-2"}
         ]
-        self.assertEqual(suffixes, ["B-1", "B-2", "A-1", "A-2"])
+        self.assertEqual(suffixes, ["A-1", "A-2", "B-1", "B-2"])
 
     def test_process_account_returns_failure_result_for_missing_name(self):
         client = Mock()
