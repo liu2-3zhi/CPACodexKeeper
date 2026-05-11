@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from getpass import getpass
@@ -22,6 +22,7 @@ DEFAULT_CPA_TIMEOUT = 30
 DEFAULT_CPA_MAX_RETRIES = 2
 DEFAULT_ENABLE_VERIFY_DELAY_SECONDS = 5
 DEFAULT_ENABLE_VERIFY_MAX_ATTEMPTS = 3
+DEFAULT_ENABLE_CONCURRENCY = 8
 
 
 def log(level: str, message: str) -> None:
@@ -200,24 +201,28 @@ def enable_accounts(client: CPAClient, accounts: list[dict]) -> int:
     skipped_invalid = 0
     failed_names: list[str] = []
 
-    account_queue = deque(enumerate(accounts, 1))
-    while account_queue:
-        idx, account = account_queue.popleft()
-        result = process_account(client, account, idx, len(accounts))
-        flush_account_logs(result.log_lines)
-        if result.invalid:
-            skipped_invalid += 1
+    futures: dict = {}
+    with ThreadPoolExecutor(max_workers=DEFAULT_ENABLE_CONCURRENCY) as executor:
+        for idx, account in enumerate(accounts, 1):
+            future = executor.submit(process_account, client, account, idx, len(accounts))
+            futures[future] = account
+
+        for future in as_completed(futures):
+            result = future.result()
+            flush_account_logs(result.log_lines)
+            if result.invalid:
+                skipped_invalid += 1
+                failures += 1
+                failed_names.append(result.name)
+                continue
+            if result.already_enabled:
+                already_enabled += 1
+                continue
+            if result.success:
+                enabled += 1
+                continue
             failures += 1
             failed_names.append(result.name)
-            continue
-        if result.already_enabled:
-            already_enabled += 1
-            continue
-        if result.success:
-            enabled += 1
-            continue
-        failures += 1
-        failed_names.append(result.name)
 
     attempted = enabled + failures - skipped_invalid
     log("INFO", f"汇总: 总处理={len(accounts)} 已启用={already_enabled} 尝试启用={attempted} 成功启用={enabled} 失败={failures} 无效={skipped_invalid}")
