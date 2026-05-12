@@ -413,6 +413,34 @@ class MaintainerTests(unittest.TestCase):
         timer_cls.assert_called_once_with(100, self.maintainer._run_tracked_recheck, args=("token-new",))
 
     @patch("src.maintainer.threading.Timer")
+    def test_set_tracked_next_check_at_moves_existing_account_to_end(self, timer_cls):
+        state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "token-a": {"next_check_at": 1000},
+                    "token-b": {"next_check_at": 1100},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        self.maintainer.disabled_accounts_path = state_path
+        self.maintainer._tracked_disabled_accounts = {
+            "token-a": {"next_check_at": 1000},
+            "token-b": {"next_check_at": 1100},
+        }
+
+        with patch("src.maintainer.time.time", return_value=1000):
+            self.maintainer._set_tracked_next_check_at("token-a", 1300)
+
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(list(payload.keys()), ["token-b", "token-a"])
+        self.assertEqual(payload["token-a"], {"next_check_at": 1300})
+        timer_cls.assert_called_once_with(300, self.maintainer._run_tracked_recheck, args=("token-a",))
+
+    @patch("src.maintainer.threading.Timer")
     def test_remove_tracked_account_preserves_other_entries_from_disk(self, _timer_cls):
         self.maintainer.disabled_accounts_path.write_text(
             '{"token-remove": {"next_check_at": 900}, "token-keep": {"next_check_at": 1200}}',
@@ -622,6 +650,33 @@ class MaintainerTests(unittest.TestCase):
 
         self.assertEqual(result, "alive")
         self.maintainer.check_token_live.assert_called_once()
+
+    def test_process_fill_token_schedules_next_check_when_disabling(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "email": "a@example.com",
+            "disabled": False,
+            "access_token": "token",
+            "refresh_token": "rt",
+            "account_id": "acc",
+            "expired": "2099-01-01T00:00:00Z",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 10, "limit_window_seconds": 18000, "reset_at": 1776634820},
+                    "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800, "reset_at": 1777000096},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        with patch("src.maintainer.time.time", return_value=1000):
+            result = self.maintainer.process_fill_token({"name": "t-fill-auto"}, 1, 1)
+
+        self.assertEqual(result, "disabled")
+        self.assertEqual(self.maintainer._get_tracked_next_check_at("t-fill-auto"), 1777000096)
 
     def test_process_token_schedules_next_check_when_auto_disabling(self):
         self.maintainer.get_token_detail = Mock(return_value={
@@ -857,6 +912,31 @@ class MaintainerTests(unittest.TestCase):
             maintainer.log.call_args_list,
         )
 
+    def test_run_tracked_recheck_skips_when_account_is_already_running(self):
+        state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
+        state_path.write_text('{"t-enable": {"next_check_at": 1000}}', encoding="utf-8")
+        self.maintainer.disabled_accounts_path = state_path
+        self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
+        self.maintainer._running_tracked_rechecks = {"t-enable"}
+        self.maintainer.process_token = Mock(return_value="alive")
+        self.maintainer.log = Mock()
+
+        self.maintainer._run_tracked_recheck("t-enable")
+
+        self.maintainer.process_token.assert_not_called()
+        self.maintainer.log.assert_any_call("INFO", "账号 t-enable 已有复查任务在执行，跳过本次补偿触发")
+
+    def test_run_tracked_recheck_clears_running_marker_after_execution(self):
+        state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
+        state_path.write_text('{"t-enable": {"next_check_at": 1000}}', encoding="utf-8")
+        self.maintainer.disabled_accounts_path = state_path
+        self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
+        self.maintainer.process_token = Mock(return_value="alive")
+
+        self.maintainer._run_tracked_recheck("t-enable")
+
+        self.assertNotIn("t-enable", self.maintainer._running_tracked_rechecks)
+
     def test_timer_priority_wraps_tracked_recheck_once_per_due_token(self):
         coordinator = RecordingCoordinator()
         maintainer = CPACodexKeeper(settings=self.settings, dry_run=True, coordinator=coordinator)
@@ -1006,6 +1086,21 @@ class MaintainerTests(unittest.TestCase):
 
         self.assertEqual(loaded, {"t-persist": {"next_check_at": 1234}})
 
+    def test_load_disabled_accounts_state_keeps_latest_duplicate_entry(self):
+        state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
+        state_path.write_text(
+            '{"token-a": {"next_check_at": 1000}, "token-b": {"next_check_at": 1100}, "token-a": {"next_check_at": 1200}}',
+            encoding="utf-8",
+        )
+        self.maintainer.disabled_accounts_path = state_path
+
+        loaded = self.maintainer._load_disabled_accounts_state()
+
+        self.assertEqual(loaded, {
+            "token-b": {"next_check_at": 1100},
+            "token-a": {"next_check_at": 1200},
+        })
+
     def test_default_state_paths_use_state_directory(self):
         maintainer = CPACodexKeeper(settings=self.settings, dry_run=True)
 
@@ -1075,6 +1170,49 @@ class MaintainerTests(unittest.TestCase):
         payload = self.maintainer._load_delete_blocked_history()
 
         self.assertEqual([event["name"] for event in payload["events"]], ["token-old"])
+
+    def test_load_delete_blocked_history_keeps_latest_duplicate_account_event(self):
+        self.maintainer.delete_blocked_accounts_path = pathlib.Path(self.temp_dir.name) / "delete_blocked_accounts.json"
+        self.maintainer.delete_blocked_accounts_path.write_text(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "name": "token-a",
+                            "reason": "old reason",
+                            "source_action": "delete",
+                            "trigger": "quota_without_refresh_token",
+                            "updated_at": "2026-05-10 10:00:00",
+                        },
+                        {
+                            "name": "token-b",
+                            "reason": "middle reason",
+                            "source_action": "delete",
+                            "trigger": "401_or_402",
+                            "updated_at": "2026-05-10 11:00:00",
+                        },
+                        {
+                            "name": "token-a",
+                            "reason": "new reason",
+                            "source_action": "delete",
+                            "trigger": "expired_without_refresh_token",
+                            "updated_at": "2026-05-10 12:00:00",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        payload = self.maintainer._load_delete_blocked_history()
+
+        self.assertEqual(
+            [event["name"] for event in payload["events"]],
+            ["token-b", "token-a"],
+        )
+        self.assertEqual(payload["events"][-1]["reason"], "new reason")
 
     def test_append_delete_blocked_event_writes_new_state_file_after_legacy_fallback_read(self):
         legacy_path = pathlib.Path(self.temp_dir.name) / "delete_blocked_accounts.json"
@@ -1161,6 +1299,44 @@ class MaintainerTests(unittest.TestCase):
 
         payload = json.loads(self.maintainer.delete_blocked_accounts_path.read_text(encoding="utf-8"))
         self.assertEqual([event["name"] for event in payload["events"]], ["token-old", "token-new"])
+
+    def test_append_delete_blocked_event_replaces_existing_account_and_moves_it_to_end(self):
+        self.maintainer.delete_blocked_accounts_path = pathlib.Path(self.temp_dir.name) / "delete_blocked_accounts.json"
+        self.maintainer.delete_blocked_accounts_path.write_text(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "name": "token-a",
+                            "reason": "old reason",
+                            "source_action": "delete",
+                            "trigger": "quota_without_refresh_token",
+                            "updated_at": "2026-05-10 10:00:00",
+                        },
+                        {
+                            "name": "token-b",
+                            "reason": "middle reason",
+                            "source_action": "delete",
+                            "trigger": "401_or_402",
+                            "updated_at": "2026-05-10 11:00:00",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        self.maintainer._append_delete_blocked_event(
+            name="token-a",
+            reason="new reason",
+            trigger="expired_without_refresh_token",
+        )
+
+        payload = json.loads(self.maintainer.delete_blocked_accounts_path.read_text(encoding="utf-8"))
+        self.assertEqual([event["name"] for event in payload["events"]], ["token-b", "token-a"])
+        self.assertEqual(payload["events"][-1]["reason"], "new reason")
 
     def test_process_token_removes_schedule_entry_when_token_deleted(self):
         self.maintainer._tracked_disabled_accounts = {"t-no-rt": {"next_check_at": 1234}}
@@ -1624,3 +1800,40 @@ class MaintainerTests(unittest.TestCase):
         self.maintainer.run()
 
         self.maintainer.log.assert_any_call("INFO", "主巡检并发设置：5 个工作线程")
+
+    def test_scan_due_tracked_rechecks_runs_due_account(self):
+        self.maintainer._tracked_disabled_accounts = {
+            "t-due": {"next_check_at": 1000},
+            "t-future": {"next_check_at": 2000},
+        }
+        self.maintainer._reload_tracked_disabled_accounts_state = Mock(return_value=self.maintainer._tracked_disabled_accounts)
+        self.maintainer._run_tracked_recheck = Mock()
+        self.maintainer.log = Mock()
+
+        with patch("src.maintainer.time.time", return_value=1500):
+            self.maintainer._scan_due_tracked_rechecks("daemon")
+
+        self.maintainer._run_tracked_recheck.assert_called_once_with("t-due")
+        self.maintainer.log.assert_any_call("INFO", "补偿扫描命中 1 个到期账号，准备立即复查")
+
+    def test_run_forever_scans_due_tracked_rechecks_each_round(self):
+        maintainer = self.maintainer
+        maintainer._scan_due_tracked_rechecks = Mock()
+        maintainer.run = Mock(side_effect=KeyboardInterrupt)
+        maintainer.log = Mock()
+
+        with self.assertRaises(KeyboardInterrupt):
+            maintainer.run_forever(interval_seconds=30)
+
+        maintainer._scan_due_tracked_rechecks.assert_called_once_with("daemon")
+
+    def test_run_fill_forever_scans_due_tracked_rechecks_each_round(self):
+        maintainer = self.maintainer
+        maintainer._scan_due_tracked_rechecks = Mock()
+        maintainer.run_fill_once = Mock(side_effect=KeyboardInterrupt)
+        maintainer.log = Mock()
+
+        with self.assertRaises(KeyboardInterrupt):
+            maintainer.run_fill_forever(interval_seconds=10)
+
+        maintainer._scan_due_tracked_rechecks.assert_called_once_with("monitor")
