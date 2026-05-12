@@ -124,6 +124,8 @@ class CPACodexKeeper:
         self._tracked_disabled_accounts = self._load_disabled_accounts_state()
         self._tracked_recheck_timers: dict[str, threading.Timer] = {}
         self._tracked_rechecks_started = False
+        self._running_tracked_rechecks: set[str] = set()
+        self._running_tracked_rechecks_lock = threading.Lock()
         self.last_usage_query_time: int | None = None
         self._last_seen_usage_by_email: dict[str, int] = {}
 
@@ -250,19 +252,42 @@ class CPACodexKeeper:
         except (OSError, json.JSONDecodeError) as exc:
             self.log("ERROR", f"加载禁用账号计划失败：{exc}")
             return {}
+        normalized = self._normalize_tracked_disabled_accounts_state(data)
+        if data != normalized:
+            try:
+                self._save_disabled_accounts_state(normalized)
+                self.log("INFO", "disabled_accounts.json 检测到重复账号记录，已按最新记录规范化")
+            except OSError as exc:
+                self.log("ERROR", f"disabled_accounts.json 规范化写回失败：{exc}")
+        return normalized
+
+    def _normalize_tracked_disabled_accounts_state(self, data):
         if not isinstance(data, dict):
             return {}
-        return data
+        normalized = {}
+        for name, entry in data.items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                continue
+            next_check_at = entry.get("next_check_at")
+            if not isinstance(next_check_at, int):
+                continue
+            normalized.pop(name, None)
+            normalized[name] = {"next_check_at": next_check_at}
+        return normalized
 
     def _disabled_accounts_lock_path(self):
         return Path(f"{self.disabled_accounts_path}.lock")
 
     def _save_disabled_accounts_state(self, payload):
-        serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
         self.disabled_accounts_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.disabled_accounts_path.with_suffix(f"{self.disabled_accounts_path.suffix}.tmp")
         tmp_path.write_text(serialized + "\n", encoding="utf-8")
         tmp_path.replace(self.disabled_accounts_path)
+
+    def _upsert_tracked_account_state(self, state, name, next_check_at):
+        state.pop(name, None)
+        state[name] = {"next_check_at": int(next_check_at)}
 
     def _locked_update_tracked_disabled_accounts(self, action_label, mutator):
         lock = FileLock(str(self._disabled_accounts_lock_path()))
@@ -307,10 +332,29 @@ class CPACodexKeeper:
             return {"events": []}
         if not isinstance(data, dict):
             return {"events": []}
-        events = data.get("events")
+        events = self._normalize_delete_blocked_events(data.get("events"))
+        normalized = {"events": events}
+        if data.get("events") != events:
+            try:
+                self._save_delete_blocked_history(normalized)
+                self.log("INFO", "delete_blocked_accounts.json 检测到重复账号记录，已按最新记录规范化")
+            except OSError as exc:
+                self.log("ERROR", f"delete_blocked_accounts.json 规范化写回失败: {exc}")
+        return normalized
+
+    def _normalize_delete_blocked_events(self, events):
         if not isinstance(events, list):
-            return {"events": []}
-        return {"events": events}
+            return []
+        normalized = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            name = event.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            normalized = [existing for existing in normalized if existing.get("name") != name]
+            normalized.append(dict(event))
+        return normalized
 
     def _save_delete_blocked_history(self, payload):
         self.delete_blocked_accounts_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,6 +369,7 @@ class CPACodexKeeper:
     def _append_delete_blocked_event(self, *, name, reason, trigger):
         with self._state_lock:
             payload = self._load_delete_blocked_history()
+            payload["events"] = [event for event in payload["events"] if event.get("name") != name]
             payload["events"].append(
                 {
                     "name": name,
@@ -401,11 +446,22 @@ class CPACodexKeeper:
         ):
             self.log("INFO", "定时复查队列已清空，较低优先级任务可以继续执行")
 
+    def _try_mark_tracked_recheck_running(self, name):
+        with self._running_tracked_rechecks_lock:
+            if name in self._running_tracked_rechecks:
+                return False
+            self._running_tracked_rechecks.add(name)
+            return True
+
+    def _clear_tracked_recheck_running(self, name):
+        with self._running_tracked_rechecks_lock:
+            self._running_tracked_rechecks.discard(name)
+
     def _set_tracked_next_check_at(self, name, ts):
         ts_int = int(ts)
         success = self._locked_update_tracked_disabled_accounts(
             f"记录 {name} 的下次复查时间",
-            lambda state: state.__setitem__(name, {"next_check_at": ts_int}),
+            lambda state: self._upsert_tracked_account_state(state, name, ts_int),
         )
         if success:
             self._schedule_tracked_recheck(name, ts_int)
@@ -426,6 +482,9 @@ class CPACodexKeeper:
         if name not in tracked_state:
             self.log("INFO", f"账号 {name} 的复查计划已不存在，跳过本次定时复查")
             return
+        if not self._try_mark_tracked_recheck_running(name):
+            self.log("INFO", f"账号 {name} 已有复查任务在执行，跳过本次补偿触发")
+            return
         self._acquire_priority("timer")
         try:
             self.logger.emit_lines([
@@ -435,7 +494,27 @@ class CPACodexKeeper:
         except Exception as exc:
             self.log("ERROR", f"账号 {name} 定时复查异常: {exc}")
         finally:
+            self._clear_tracked_recheck_running(name)
             self._release_priority("timer")
+
+    def _scan_due_tracked_rechecks(self, source):
+        self.log("INFO", f"开始扫描到期复查账号补偿队列（source={source}）")
+        tracked_state = self._reload_tracked_disabled_accounts_state()
+        now = int(time.time())
+        due_names = []
+        for name, entry in tracked_state.items():
+            if not isinstance(entry, dict):
+                continue
+            next_check_at = entry.get("next_check_at")
+            if isinstance(next_check_at, int) and next_check_at <= now:
+                due_names.append(name)
+        if not due_names:
+            self.log("INFO", "补偿扫描未命中到期账号")
+            return
+        self.log("INFO", f"补偿扫描命中 {len(due_names)} 个到期账号，准备立即复查")
+        for name in due_names:
+            self.log("INFO", f"账号 {name} 已到计划复查时间，但未见定时复查完成，启动补偿复查")
+            self._run_tracked_recheck(name)
 
     def _collect_threshold_reaching_reset_ats(self, body_info):
         reached_reset_ats = []
@@ -627,7 +706,17 @@ class CPACodexKeeper:
                     indent=1,
                 )
                 if self.set_disabled_status(name, disabled=True, logger=logger):
+                    next_check_at = self._compute_next_check_at_from_usage(
+                        body_info,
+                        int(time.time()),
+                        self.settings.quota_reset_none_recheck_seconds,
+                        token_detail=token_detail,
+                    )
                     logger.log("DISABLE", "账号已禁用", indent=1)
+                    if self._set_tracked_next_check_at(name, next_check_at):
+                        logger.log("INFO", f"已记录下次检查额度时间: {self._format_tracked_next_check_at(next_check_at)}", indent=1)
+                    else:
+                        logger.log("ERROR", "账号已禁用，但记录复查计划失败", indent=1)
                     self._inc_stat("disabled")
                     logger.blank_line()
                     return "disabled"
@@ -1141,6 +1230,7 @@ class CPACodexKeeper:
         self.log("INFO", f"主巡检守护进程已启动（轮询间隔: {interval_seconds} 秒）")
         while True:
             round_no += 1
+            self._scan_due_tracked_rechecks("daemon")
             self.log("INFO", f"主巡检第 {round_no} 轮开始：准备扫描全部 codex 账号")
             try:
                 self.run()
@@ -1203,6 +1293,7 @@ class CPACodexKeeper:
             round_no += 1
             self.log("INFO", f"日志巡检第 {round_no} 轮开始：准备扫描新增CPA使用日志")
             try:
+                self._scan_due_tracked_rechecks("monitor")
                 self.run_fill_once()
                 self.log("INFO", f"日志巡检第 {round_no} 轮结束：已完成本轮CPA使用日志扫描")
             except KeyboardInterrupt:
