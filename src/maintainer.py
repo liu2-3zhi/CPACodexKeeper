@@ -87,6 +87,7 @@ class CPACodexKeeper:
         ("full", "timer"): "优先级协调：定时复查正在等待，主巡检将在当前 Token 完成后暂停",
         ("log", "timer"): "优先级协调：定时复查正在等待，日志巡检将在当前 Token 完成后暂停",
     }
+    TRACKED_RECHECK_DETAIL_FAILURE_THRESHOLD = 3
     def __init__(
         self,
         settings: Settings,
@@ -126,6 +127,7 @@ class CPACodexKeeper:
         self._tracked_rechecks_started = False
         self._running_tracked_rechecks: set[str] = set()
         self._running_tracked_rechecks_lock = threading.Lock()
+        self._tracked_recheck_detail_failures: dict[str, int] = {}
         self.last_usage_query_time: int | None = None
         self._last_seen_usage_by_email: dict[str, int] = {}
 
@@ -457,6 +459,17 @@ class CPACodexKeeper:
         with self._running_tracked_rechecks_lock:
             self._running_tracked_rechecks.discard(name)
 
+    def _get_tracked_recheck_detail_failure(self, name):
+        return self._tracked_recheck_detail_failures.get(name, 0)
+
+    def _inc_tracked_recheck_detail_failure(self, name):
+        failures = self._tracked_recheck_detail_failures.get(name, 0) + 1
+        self._tracked_recheck_detail_failures[name] = failures
+        return failures
+
+    def _clear_tracked_recheck_detail_failure(self, name):
+        self._tracked_recheck_detail_failures.pop(name, None)
+
     def _set_tracked_next_check_at(self, name, ts):
         ts_int = int(ts)
         success = self._locked_update_tracked_disabled_accounts(
@@ -490,7 +503,7 @@ class CPACodexKeeper:
             self.logger.emit_lines([
                 self.logger.format_log_record("INFO", f"账号 {name} 到达计划复查时间，开始复查使用额度")
             ])
-            self.process_token({"name": name}, 1, 1)
+            self.process_token({"name": name}, 1, 1, trigger_source="tracked_recheck")
         except Exception as exc:
             self.log("ERROR", f"账号 {name} 定时复查异常: {exc}")
         finally:
@@ -759,6 +772,29 @@ class CPACodexKeeper:
             self._inc_stat("network_error")
             logger.blank_line()
             return "network_error"
+        self._inc_stat("skipped")
+        logger.blank_line()
+        return "skipped"
+
+    def _handle_missing_token_detail(self, name, logger, *, trigger_source=None):
+        if trigger_source != "tracked_recheck":
+            return self._skip_token("获取账号详情失败", logger)
+
+        failure_count = self._inc_tracked_recheck_detail_failure(name)
+        threshold = self.TRACKED_RECHECK_DETAIL_FAILURE_THRESHOLD
+        if failure_count < threshold:
+            return self._skip_token(
+                f"自动复查第 {failure_count} 次获取账号详情失败，暂不判定文件丢失",
+                logger,
+            )
+
+        self._remove_tracked_account(name)
+        self._clear_tracked_recheck_detail_failure(name)
+        logger.log(
+            "WARN",
+            f"自动复查连续 {threshold} 次获取账号详情失败，视为账号文件已丢失，已停止继续复查",
+            indent=1,
+        )
         self._inc_stat("skipped")
         logger.blank_line()
         return "skipped"
@@ -1046,13 +1082,19 @@ class CPACodexKeeper:
         elif remaining_seconds > 0:
             logger.log("INFO", f"过期时间充足 ({remaining_str})", indent=1)
 
-    def process_token(self, token_info, idx, total, *, force_refresh_on_expiry=None):
+    def process_token(self, token_info, idx, total, *, force_refresh_on_expiry=None, trigger_source=None):
         name = token_info.get("name", "unknown")
         logger = TokenLogger(self.logger, idx, total, name)
         try:
             token_detail = self.get_token_detail(name)
             if not token_detail:
-                return self._skip_token("获取账号详情失败", logger)
+                return self._handle_missing_token_detail(
+                    name,
+                    logger,
+                    trigger_source=trigger_source,
+                )
+            if trigger_source == "tracked_recheck":
+                self._clear_tracked_recheck_detail_failure(name)
 
             disabled, remaining_seconds, remaining_str, expiry_known = self._log_token_details(token_detail, logger)
             tracked_next_check_at = self._get_tracked_next_check_at(name)

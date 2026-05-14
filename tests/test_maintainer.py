@@ -937,6 +937,22 @@ class MaintainerTests(unittest.TestCase):
 
         self.assertNotIn("t-enable", self.maintainer._running_tracked_rechecks)
 
+    def test_run_tracked_recheck_passes_tracked_recheck_trigger_source(self):
+        state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
+        state_path.write_text('{"t-trigger": {"next_check_at": 1000}}', encoding="utf-8")
+        self.maintainer.disabled_accounts_path = state_path
+        self.maintainer._tracked_disabled_accounts = {"t-trigger": {"next_check_at": 1000}}
+        self.maintainer.process_token = Mock(return_value="alive")
+
+        self.maintainer._run_tracked_recheck("t-trigger")
+
+        self.maintainer.process_token.assert_called_once_with(
+            {"name": "t-trigger"},
+            1,
+            1,
+            trigger_source="tracked_recheck",
+        )
+
     def test_timer_priority_wraps_tracked_recheck_once_per_due_token(self):
         coordinator = RecordingCoordinator()
         maintainer = CPACodexKeeper(settings=self.settings, dry_run=True, coordinator=coordinator)
@@ -996,6 +1012,43 @@ class MaintainerTests(unittest.TestCase):
         self.assertIn("到达计划复查时间，开始复查使用额度", emitted)
         self.assertIn("已重新启用", emitted)
 
+    def test_process_token_clears_recheck_detail_failures_after_successful_detail_fetch(self):
+        self.maintainer._tracked_recheck_detail_failures = {"t-enable": 2}
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t-enable", "disabled": False},
+        ])
+        self.maintainer._tracked_disabled_accounts = {"t-enable": {"next_check_at": 1000}}
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1776634820},
+                    "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 1777000096},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        with patch("src.maintainer.time.time", return_value=1000), patch("src.maintainer.time.sleep"):
+            result = self.maintainer.process_token(
+                {"name": "t-enable"},
+                1,
+                1,
+                trigger_source="tracked_recheck",
+            )
+
+        self.assertEqual(result, "alive")
+        self.assertEqual(self.maintainer._get_tracked_recheck_detail_failure("t-enable"), 0)
+
     def test_run_tracked_recheck_skips_when_persisted_entry_is_gone(self):
         state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
         state_path.write_text("{}", encoding="utf-8")
@@ -1050,6 +1103,51 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(result, "alive")
         self.assertEqual(self.maintainer._get_tracked_next_check_at("t-requeue"), 2800)
 
+    def test_process_token_keeps_tracked_account_when_recheck_detail_failures_below_threshold(self):
+        captured_lines = []
+        state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
+        state_path.write_text('{"t-missing": {"next_check_at": 1000}}', encoding="utf-8")
+        self.maintainer.disabled_accounts_path = state_path
+        self.maintainer._tracked_disabled_accounts = {"t-missing": {"next_check_at": 1000}}
+        self.maintainer.get_token_detail = Mock(return_value=None)
+        self.maintainer.logger.emit_lines = Mock(side_effect=lambda lines: captured_lines.append(list(lines)))
+
+        result = self.maintainer.process_token(
+            {"name": "t-missing"},
+            1,
+            1,
+            trigger_source="tracked_recheck",
+        )
+
+        self.assertEqual(result, "skipped")
+        self.assertEqual(self.maintainer._get_tracked_recheck_detail_failure("t-missing"), 1)
+        self.assertEqual(self.maintainer._get_tracked_next_check_at("t-missing"), 1000)
+        emitted = "\n".join(line for batch in captured_lines for line in batch)
+        self.assertIn("自动复查第 1 次获取账号详情失败，暂不判定文件丢失", emitted)
+
+    def test_process_token_removes_tracked_account_after_recheck_detail_failure_threshold(self):
+        captured_lines = []
+        state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
+        state_path.write_text('{"t-missing": {"next_check_at": 1000}}', encoding="utf-8")
+        self.maintainer.disabled_accounts_path = state_path
+        self.maintainer._tracked_disabled_accounts = {"t-missing": {"next_check_at": 1000}}
+        self.maintainer._tracked_recheck_detail_failures = {"t-missing": 2}
+        self.maintainer.get_token_detail = Mock(return_value=None)
+        self.maintainer.logger.emit_lines = Mock(side_effect=lambda lines: captured_lines.append(list(lines)))
+
+        result = self.maintainer.process_token(
+            {"name": "t-missing"},
+            1,
+            1,
+            trigger_source="tracked_recheck",
+        )
+
+        self.assertEqual(result, "skipped")
+        self.assertIsNone(self.maintainer._get_tracked_next_check_at("t-missing"))
+        self.assertEqual(self.maintainer._get_tracked_recheck_detail_failure("t-missing"), 0)
+        emitted = "\n".join(line for batch in captured_lines for line in batch)
+        self.assertIn("自动复查连续 3 次获取账号详情失败，视为账号文件已丢失，已停止继续复查", emitted)
+
     def test_process_token_keeps_manual_disabled_token_disabled_when_below_threshold(self):
         self.maintainer.get_token_detail = Mock(return_value={
             "email": "a@example.com",
@@ -1076,6 +1174,14 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(result, "alive")
         self.maintainer.set_disabled_status.assert_not_called()
         self.assertEqual(self.maintainer.stats.enabled, 0)
+
+    def test_process_token_detail_failure_does_not_count_for_normal_run(self):
+        self.maintainer.get_token_detail = Mock(return_value=None)
+
+        result = self.maintainer.process_token({"name": "t-normal-missing"}, 1, 1)
+
+        self.assertEqual(result, "skipped")
+        self.assertEqual(self.maintainer._tracked_recheck_detail_failures, {})
 
     def test_state_load_reads_existing_disabled_account_schedule(self):
         state_path = pathlib.Path(self.temp_dir.name) / "disabled_accounts.json"
