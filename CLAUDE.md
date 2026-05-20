@@ -55,3 +55,5 @@ Important current behavior:
 - `main` must not contain AI traces.
 - Do not invert that relationship when preparing or describing branch-related work.
 - Do not automatically apply AI-authored repository memory files, planning docs, or similar trace-bearing changes to `main`.
+- When keeping `main` and `new` in sync, sync business code and user-facing docs only; do not force file-for-file equality between the branches.
+- Files such as `CLAUDE.md` and `docs/superpowers/**` may exist only on `new`, while runtime code, tests, and README content should stay aligned across both branches.
