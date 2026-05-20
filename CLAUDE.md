@@ -53,3 +53,4 @@ Important current behavior:
 - `new` is the branch that keeps AI traces.
 - `main` is the de-AI version derived from `new`.
 - Do not invert that relationship when preparing or describing branch-related work.
+- When the user asks to submit or finish branch work and does not say otherwise, handle both `new` and `main` in line with this repository workflow instead of leaving the change on only one of them.
