@@ -231,8 +231,8 @@ class CPACodexKeeper:
             "has_credits": usage.has_credits,
         }
 
-    def get_usage_log(self):
-        return self.cpa_client.get_usage_log(lookback_seconds=self.settings.usage_query_interval_seconds)
+    def get_usage_log(self, *, lookback_seconds):
+        return self.cpa_client.get_usage_log(lookback_seconds=lookback_seconds)
 
     def _read_json_file(self, path):
         return json.loads(path.read_text(encoding="utf-8"))
@@ -611,7 +611,7 @@ class CPACodexKeeper:
         if reached_reset_ats:
             return max(reached_reset_ats)
         if usage_data is None and token_detail is not None:
-            usage_data = self.get_usage_log()
+            usage_data = self.get_usage_log(lookback_seconds=self.settings.fill_interval_seconds if self.settings.fill_interval_seconds > 0 else 0)
         latest_usage_timestamp = self._latest_usage_timestamp_for_token(usage_data, token_detail)
         if latest_usage_timestamp is not None:
             window_seconds = self._collect_threshold_reaching_window_seconds(body_info)
@@ -633,13 +633,12 @@ class CPACodexKeeper:
                 latest_by_email[email] = parsed_timestamp
         return latest_by_email
 
-    def _new_usage_timestamp_by_email(self, usage_data, *, overlap_seconds=0):
-        after_timestamp = None
-        if self.last_usage_query_time is not None:
-            after_timestamp = self.last_usage_query_time - max(0, overlap_seconds)
-        latest_by_email = self._latest_usage_timestamp_by_email(usage_data, after_timestamp=after_timestamp)
+    def _new_usage_timestamp_by_email(self, usage_data, *, cursor_time=None):
+        latest_by_email = self._latest_usage_timestamp_by_email(usage_data, after_timestamp=None)
         new_by_email = {}
         for email, parsed_timestamp in latest_by_email.items():
+            if cursor_time is not None and parsed_timestamp < cursor_time:
+                continue
             last_seen = self._last_seen_usage_by_email.get(email)
             if last_seen is not None and parsed_timestamp <= last_seen:
                 continue
@@ -1156,10 +1155,10 @@ class CPACodexKeeper:
             logger.flush()
 
     def log_startup(self):
-        usage_query_interval_display = (
-            "已禁用（CPA_USAGE_QUERY_INTERVAL=0）"
-            if self.settings.usage_query_interval_seconds == 0
-            else f"{self.settings.usage_query_interval_seconds} 秒"
+        log_inspection_display = (
+            "已禁用（CPA_FILL_INTERVAL<=0）"
+            if self.settings.fill_interval_seconds <= 0
+            else f"每 {self.settings.fill_interval_seconds} 秒轮询，按内存游标推进日志窗口"
         )
         fill_interval_display = f"{self.settings.fill_interval_seconds} 秒"
         lines = [
@@ -1170,7 +1169,7 @@ class CPACodexKeeper:
             self.logger.format_log_record("INFO", f"过期刷新阈值: {self.settings.expiry_threshold_days} 天", indent=1),
             self.logger.format_log_record("INFO", f"主巡检间隔: {self.settings.interval_seconds} 秒", indent=1),
             self.logger.format_log_record("INFO", f"日志巡检轮询间隔: {fill_interval_display}", indent=1),
-            self.logger.format_log_record("INFO", f"日志巡检查询窗口: {usage_query_interval_display}", indent=1),
+            self.logger.format_log_record("INFO", f"日志巡检窗口: {log_inspection_display}", indent=1),
             self.logger.format_log_record("INFO", f"主巡检线程数: {self.settings.worker_threads}", indent=1),
             self.logger.format_log_record("INFO", f"自动刷新: {'开启' if self.settings.enable_refresh else '关闭'}", indent=1),
             self.logger.format_log_record("INFO", f"允许删除账号文件: {'开启' if self.settings.allow_delete else '关闭'}", indent=1),
@@ -1277,8 +1276,8 @@ class CPACodexKeeper:
             time.sleep(interval_seconds)
 
     def run_fill_once(self):
-        if self.settings.usage_query_interval_seconds == 0:
-            self.log("INFO", "日志巡检已禁用：CPA_USAGE_QUERY_INTERVAL=0，跳过本轮CPA使用日志扫描")
+        if self.settings.fill_interval_seconds <= 0:
+            self.log("INFO", "日志巡检已禁用：CPA_FILL_INTERVAL<=0，跳过本轮CPA使用日志扫描")
             return "disabled"
 
         now = int(time.time())
@@ -1288,14 +1287,16 @@ class CPACodexKeeper:
             return "primed"
 
         query_started_at = now
-        usage_data = self.get_usage_log()
+        cursor_time = self.last_usage_query_time
+        lookback_seconds = max(0, query_started_at - cursor_time)
+        usage_data = self.get_usage_log(lookback_seconds=lookback_seconds)
         if not usage_data:
             self.log("WARN", "日志巡检未获取到CPA日志数据：本轮无法筛选新增调用账号")
             return "skipped"
 
         latest_by_email = self._new_usage_timestamp_by_email(
             usage_data,
-            overlap_seconds=self.settings.fill_interval_seconds,
+            cursor_time=cursor_time,
         )
         token_map = self.get_fill_token_map()
         matched_tokens = []
@@ -1316,8 +1317,11 @@ class CPACodexKeeper:
         else:
             self.log("INFO", "日志巡检未命中新账号：本轮没有需要进一步检查的CPA使用记录")
 
-        self._last_seen_usage_by_email.update(latest_by_email)
-        self.last_usage_query_time = query_started_at
+        if latest_by_email:
+            self._last_seen_usage_by_email.update(latest_by_email)
+            self.last_usage_query_time = max(latest_by_email.values())
+        else:
+            self.last_usage_query_time = query_started_at
         return "processed"
 
     def run_fill_forever(self, interval_seconds=10):
