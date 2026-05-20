@@ -63,19 +63,19 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(SettingsError):
                 load_settings(env_file=env_file)
 
-    def test_load_settings_reads_usage_query_interval(self):
+    def test_load_settings_reads_fill_interval_zero(self):
         with patch.dict(
             os.environ,
             {
                 "CPA_ENDPOINT": "https://example.com",
                 "CPA_TOKEN": "secret",
-                "CPA_USAGE_QUERY_INTERVAL": "7200",
+                "CPA_FILL_INTERVAL": "0",
             },
             clear=True,
         ):
             settings = load_settings()
 
-        self.assertEqual(settings.usage_query_interval_seconds, 7200)
+        self.assertEqual(settings.fill_interval_seconds, 0)
 
     def test_load_settings_uses_default_full_scan_interval_bounds(self):
         with patch.dict(
@@ -218,19 +218,19 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.fill_interval_seconds, 10)
 
-    def test_load_settings_allows_zero_usage_query_interval(self):
+    def test_load_settings_reads_fill_interval_negative_one(self):
         with patch.dict(
             os.environ,
             {
                 "CPA_ENDPOINT": "https://example.com",
                 "CPA_TOKEN": "secret",
-                "CPA_USAGE_QUERY_INTERVAL": "0",
+                "CPA_FILL_INTERVAL": "-1",
             },
             clear=True,
         ):
             settings = load_settings()
 
-        self.assertEqual(settings.usage_query_interval_seconds, 0)
+        self.assertEqual(settings.fill_interval_seconds, -1)
 
     def test_load_settings_reads_allow_delete_false(self):
         with patch.dict(

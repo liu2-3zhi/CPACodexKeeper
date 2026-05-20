@@ -74,7 +74,7 @@ This process is **round-based and sequential per account**. One full round still
 
 In daemon mode, two additional paths may run alongside the main full scan:
 
-- When `CPA_USAGE_QUERY_INTERVAL > 0`, the keeper also starts a log-driven inspection loop based on `/v0/management/usage`. It compares against the previous query time, keeps only accounts that had new usage in that interval and still exist in filtered codex auth-files, then runs quota checks only for those accounts. This log-driven loop only disables; it does not re-enable, refresh, or delete.
+- When `CPA_FILL_INTERVAL > 0`, the keeper also starts a log-driven inspection loop based on `/v0/management/usage`. The first round only records a start time and does not query usage logs yet. The second round queries logs from that recorded start time to the current time, and later rounds use an inclusive in-memory cursor that starts from the last successfully processed log timestamp while still de-duplicating locally by email so same-second logs are not missed. If a fetch fails, the in-memory cursor does not advance; if a fetch succeeds but yields no eligible logs, the cursor advances to the current round's query-start time. This log-driven loop only disables; it does not re-enable, refresh, or delete. After a process restart, the cursor starts over from the first priming round.
 - For accounts auto-disabled by the keeper and written into `disabled_accounts.json`, the keeper records `next_check_at` and arms an independent timer. When the timer fires, quota is rechecked immediately; if quota has recovered the account is re-enabled, otherwise a new recheck time is scheduled. `disabled_accounts.json` records planned automatic rechecks only; it does not stop the main full scan from inspecting already-disabled accounts.
 
 ---
@@ -146,8 +146,8 @@ Then edit `.env`.
 - `CPA_ALLOW_DELETE`: whether auth-files may be deleted, default `true`; when set to `false`, main-flow delete actions are converted into disable actions
 - `CPA_HTTP_TIMEOUT`: timeout for CPA API requests, default `30`
 - `CPA_USAGE_TIMEOUT`: timeout for OpenAI usage requests, default `15`
-- `CPA_USAGE_QUERY_INTERVAL`: log inspection interval in seconds, also used as the lookback window when querying `/v0/management/usage`, default `7200`; set to `0` to disable log inspection
 - `CPA_MAX_RETRIES`: retry count for transient network / 5xx failures, default `2`
+- `CPA_FILL_INTERVAL`: log inspection polling interval in seconds, default `10`; set it to `0` or a negative value to disable log inspection
 - `CPA_FULL_SCAN_MIN_INTERVAL_SECONDS`: minimum delay in seconds between accounts during the main full scan, default `10`
 - `CPA_FULL_SCAN_MAX_INTERVAL_SECONDS`: maximum delay in seconds between accounts during the main full scan, default `60`
 - `CPA_WORKER_THREADS`: retained for compatibility, default `8`; the current main full scan now runs sequentially and no longer uses this value to control concurrency
@@ -199,7 +199,7 @@ By default this starts:
 
 - the original full inspection loop (sequential per account, with configured pacing between accounts)
 - timer-based rechecks for accounts already recorded in `disabled_accounts.json`
-- and, when `CPA_USAGE_QUERY_INTERVAL > 0`, an additional log-driven inspection thread
+- and, when `CPA_FILL_INTERVAL > 0`, an additional log-driven inspection thread
 
 ### Dry run
 

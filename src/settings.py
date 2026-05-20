@@ -9,7 +9,6 @@ DEFAULT_QUOTA_THRESHOLD = 100
 DEFAULT_QUOTA_RESET_NONE_RECHECK_SECONDS = 18000
 DEFAULT_EXPIRY_THRESHOLD_DAYS = 3
 DEFAULT_USAGE_TIMEOUT_SECONDS = 15
-DEFAULT_USAGE_QUERY_INTERVAL_SECONDS = 7200
 DEFAULT_CPA_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_WORKER_THREADS = 8
@@ -41,7 +40,6 @@ class Settings:
     quota_reset_none_recheck_seconds: int = DEFAULT_QUOTA_RESET_NONE_RECHECK_SECONDS
     expiry_threshold_days: int = DEFAULT_EXPIRY_THRESHOLD_DAYS
     usage_timeout_seconds: int = DEFAULT_USAGE_TIMEOUT_SECONDS
-    usage_query_interval_seconds: int = DEFAULT_USAGE_QUERY_INTERVAL_SECONDS
     cpa_timeout_seconds: int = DEFAULT_CPA_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_MAX_RETRIES
     worker_threads: int = DEFAULT_WORKER_THREADS
@@ -160,7 +158,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         cpa_token=token,
         proxy=proxy,
         interval_seconds=_read_int("CPA_INTERVAL", DEFAULT_INTERVAL_SECONDS, env_values, minimum=1),
-        fill_interval_seconds=_read_int("CPA_FILL_INTERVAL", DEFAULT_FILL_INTERVAL_SECONDS, env_values, minimum=1),
+        fill_interval_seconds=_read_int("CPA_FILL_INTERVAL", DEFAULT_FILL_INTERVAL_SECONDS, env_values, minimum=-2147483648),
         quota_threshold=_read_int("CPA_QUOTA_THRESHOLD", DEFAULT_QUOTA_THRESHOLD, env_values, minimum=0, maximum=100),
         quota_reset_none_recheck_seconds=_read_int(
             "CPA_QUOTA_RESET_NONE_RECHECK_SECONDS",
@@ -170,12 +168,6 @@ def load_settings(env_file: Path | None = None) -> Settings:
         ),
         expiry_threshold_days=_read_int("CPA_EXPIRY_THRESHOLD_DAYS", DEFAULT_EXPIRY_THRESHOLD_DAYS, env_values, minimum=0),
         usage_timeout_seconds=_read_int("CPA_USAGE_TIMEOUT", DEFAULT_USAGE_TIMEOUT_SECONDS, env_values, minimum=1),
-        usage_query_interval_seconds=_read_int(
-            "CPA_USAGE_QUERY_INTERVAL",
-            DEFAULT_USAGE_QUERY_INTERVAL_SECONDS,
-            env_values,
-            minimum=0,
-        ),
         cpa_timeout_seconds=_read_int("CPA_HTTP_TIMEOUT", DEFAULT_CPA_TIMEOUT_SECONDS, env_values, minimum=1),
         max_retries=_read_int("CPA_MAX_RETRIES", DEFAULT_MAX_RETRIES, env_values, minimum=0, maximum=5),
         worker_threads=_read_int("CPA_WORKER_THREADS", DEFAULT_WORKER_THREADS, env_values, minimum=1),

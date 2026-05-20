@@ -130,7 +130,7 @@ class CLITests(unittest.TestCase):
         load_settings_mock.return_value = Settings(
             cpa_endpoint="https://example.com",
             cpa_token="secret",
-            usage_query_interval_seconds=7200,
+            fill_interval_seconds=10,
         )
         main_keeper = Mock()
         main_keeper.logger = object()
@@ -151,7 +151,7 @@ class CLITests(unittest.TestCase):
         load_settings_mock.return_value = Settings(
             cpa_endpoint="https://example.com",
             cpa_token="secret",
-            usage_query_interval_seconds=7200,
+            fill_interval_seconds=10,
         )
         main_keeper = Mock()
         main_keeper.logger = object()
@@ -169,12 +169,11 @@ class CLITests(unittest.TestCase):
     @patch("src.cli.load_settings")
     @patch("src.cli.CPACodexKeeper")
     @patch("sys.argv", ["prog"])
-    def test_main_runs_daemon_and_starts_fill_thread_when_usage_query_enabled(self, keeper_cls, load_settings_mock, thread_cls):
+    def test_main_runs_daemon_and_starts_fill_thread_when_fill_interval_is_positive(self, keeper_cls, load_settings_mock, thread_cls):
         load_settings_mock.return_value = Settings(
             cpa_endpoint="https://example.com",
             cpa_token="secret",
             fill_interval_seconds=10,
-            usage_query_interval_seconds=7200,
         )
         main_keeper = Mock()
         fill_keeper = Mock()
@@ -201,7 +200,6 @@ class CLITests(unittest.TestCase):
             cpa_endpoint="https://example.com",
             cpa_token="secret",
             fill_interval_seconds=10,
-            usage_query_interval_seconds=7200,
         )
         keeper = keeper_cls.return_value
 
@@ -219,12 +217,11 @@ class CLITests(unittest.TestCase):
     @patch("src.cli.load_settings")
     @patch("src.cli.CPACodexKeeper")
     @patch("sys.argv", ["prog", "-monitor"])
-    def test_main_monitor_mode_runs_fill_forever_even_when_usage_query_disabled(self, keeper_cls, load_settings_mock, thread_cls):
+    def test_main_monitor_mode_runs_fill_forever_with_zero_fill_interval(self, keeper_cls, load_settings_mock, thread_cls):
         load_settings_mock.return_value = Settings(
             cpa_endpoint="https://example.com",
             cpa_token="secret",
-            fill_interval_seconds=10,
-            usage_query_interval_seconds=0,
+            fill_interval_seconds=0,
         )
         keeper = keeper_cls.return_value
 
@@ -233,7 +230,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(keeper_cls.call_count, 1)
         keeper._start_tracked_rechecks.assert_called_once()
-        keeper.run_fill_forever.assert_called_once_with(interval_seconds=10)
+        keeper.run_fill_forever.assert_called_once_with(interval_seconds=0)
         keeper.run_forever.assert_not_called()
         keeper.run.assert_not_called()
         thread_cls.assert_not_called()
@@ -246,7 +243,7 @@ class CLITests(unittest.TestCase):
         load_settings_mock.return_value = Settings(
             cpa_endpoint="https://example.com",
             cpa_token="secret",
-            usage_query_interval_seconds=0,
+            fill_interval_seconds=0,
         )
         keeper = keeper_cls.return_value
 
@@ -261,11 +258,11 @@ class CLITests(unittest.TestCase):
     @patch("src.cli.load_settings")
     @patch("src.cli.CPACodexKeeper")
     @patch("sys.argv", ["prog"])
-    def test_main_runs_daemon_without_fill_thread_when_usage_query_disabled(self, keeper_cls, load_settings_mock, thread_cls):
+    def test_main_runs_daemon_without_fill_thread_when_fill_interval_is_zero(self, keeper_cls, load_settings_mock, thread_cls):
         load_settings_mock.return_value = Settings(
             cpa_endpoint="https://example.com",
             cpa_token="secret",
-            usage_query_interval_seconds=0,
+            fill_interval_seconds=0,
         )
         keeper = keeper_cls.return_value
 

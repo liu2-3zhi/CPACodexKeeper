@@ -550,7 +550,7 @@ class MaintainerTests(unittest.TestCase):
 
     def test_process_token_uses_reset_none_fallback_when_usage_logs_do_not_match(self):
         self.maintainer.settings.quota_reset_none_recheck_seconds = 3600
-        self.maintainer.settings.usage_query_interval_seconds = 7200
+        self.maintainer.settings.fill_interval_seconds = 10
         self.maintainer.get_token_detail = Mock(return_value={
             "email": "missing@example.com",
             "disabled": False,
@@ -1989,6 +1989,72 @@ class MaintainerTests(unittest.TestCase):
             maintainer.run_forever(interval_seconds=30)
 
         maintainer._scan_due_tracked_rechecks.assert_called_once_with("daemon")
+
+    def test_run_fill_once_primes_cursor_without_requesting_usage_logs(self):
+        self.maintainer.settings.fill_interval_seconds = 10
+        self.maintainer.get_usage_log = Mock()
+
+        with patch("src.maintainer.time.time", return_value=1000):
+            result = self.maintainer.run_fill_once()
+
+        self.assertEqual(result, "primed")
+        self.assertEqual(self.maintainer.last_usage_query_time, 1000)
+        self.maintainer.get_usage_log.assert_not_called()
+
+    def test_run_fill_once_skips_when_fill_interval_is_zero(self):
+        self.maintainer.settings.fill_interval_seconds = 0
+        self.maintainer.get_usage_log = Mock()
+
+        result = self.maintainer.run_fill_once()
+
+        self.assertEqual(result, "disabled")
+        self.maintainer.get_usage_log.assert_not_called()
+
+    def test_run_fill_once_advances_cursor_on_successful_empty_usage_logs(self):
+        self.maintainer.settings.fill_interval_seconds = 10
+        self.maintainer.last_usage_query_time = 1000
+        self.maintainer.get_usage_log = Mock(return_value={"usage": {"apis": {}}})
+        self.maintainer.get_fill_token_map = Mock(return_value={})
+
+        with patch("src.maintainer.time.time", return_value=1050):
+            result = self.maintainer.run_fill_once()
+
+        self.assertEqual(result, "processed")
+        self.assertEqual(self.maintainer.last_usage_query_time, 1050)
+
+    def test_run_fill_once_does_not_advance_cursor_on_usage_log_failure(self):
+        self.maintainer.settings.fill_interval_seconds = 10
+        self.maintainer.last_usage_query_time = 1000
+        self.maintainer.get_usage_log = Mock(return_value=None)
+
+        with patch("src.maintainer.time.time", return_value=1050):
+            result = self.maintainer.run_fill_once()
+
+        self.assertEqual(result, "skipped")
+        self.assertEqual(self.maintainer.last_usage_query_time, 1000)
+
+    def test_new_usage_timestamp_by_email_keeps_same_second_new_emails_without_reprocessing_seen_email(self):
+        self.maintainer._last_seen_usage_by_email = {"seen@example.com": 1716076800}
+        usage_data = {
+            "usage": {
+                "apis": {
+                    "api-1": {
+                        "models": {
+                            "gpt-5.3-codex": {
+                                "details": [
+                                    {"source": "seen@example.com", "timestamp": "2024-05-19T00:00:00+00:00"},
+                                    {"source": "new@example.com", "timestamp": "2024-05-19T00:00:00+00:00"},
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        latest = self.maintainer._new_usage_timestamp_by_email(usage_data, cursor_time=1716076800)
+
+        self.assertEqual(latest, {"new@example.com": 1716076800})
 
     def test_run_fill_forever_scans_due_tracked_rechecks_each_round(self):
         maintainer = self.maintainer

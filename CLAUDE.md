@@ -29,7 +29,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 There are three distinct operational paths that share state but have different roles:
 
 1. Full scan: scans all `type=codex` accounts and applies the main maintenance rules.
-2. Log-driven inspection: when `CPA_USAGE_QUERY_INTERVAL > 0`, inspects only recently-used accounts from CPA usage logs and only performs quota-based disable decisions.
+2. Log-driven inspection: when `CPA_FILL_INTERVAL > 0`, inspects recently-used accounts from CPA usage logs and only performs quota-based disable decisions. The first round primes an in-memory start time, later rounds query from that cursor forward inclusively, and same-second duplicates are filtered locally by per-email last-seen timestamps.
 3. Tracked timer-based recheck: restores and executes follow-up rechecks from `disabled_accounts.json`.
 
 Important current behavior:
