@@ -151,7 +151,6 @@ cp .env.example .env
 - `CPA_FILL_INTERVAL`：日志巡检轮询间隔秒数，默认 `10`；设为 `0` 或负数表示禁用日志巡检
 - `CPA_FULL_SCAN_MIN_INTERVAL_SECONDS`：主巡检两个账号之间的最小等待秒数，默认 `10`
 - `CPA_FULL_SCAN_MAX_INTERVAL_SECONDS`：主巡检两个账号之间的最大等待秒数，默认 `60`
-- `CPA_WORKER_THREADS`：保留配置项，默认 `8`；当前主巡检已改为逐账号串行执行，不再使用该值控制并发度
 - `CPA_LOG_ARCHIVE_MAX_SIZE_MB`：日志归档目录 `./logs/archive` 的总大小上限（MB），默认 `500`
 
 推荐直接参考 `.env.example` 中的中英双语注释填写。

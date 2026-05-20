@@ -1170,7 +1170,6 @@ class CPACodexKeeper:
             self.logger.format_log_record("INFO", f"主巡检间隔: {self.settings.interval_seconds} 秒", indent=1),
             self.logger.format_log_record("INFO", f"日志巡检轮询间隔: {fill_interval_display}", indent=1),
             self.logger.format_log_record("INFO", f"日志巡检窗口: {log_inspection_display}", indent=1),
-            self.logger.format_log_record("INFO", f"主巡检线程数: {self.settings.worker_threads}", indent=1),
             self.logger.format_log_record("INFO", f"自动刷新: {'开启' if self.settings.enable_refresh else '关闭'}", indent=1),
             self.logger.format_log_record("INFO", f"允许删除账号文件: {'开启' if self.settings.allow_delete else '关闭'}", indent=1),
         ]
