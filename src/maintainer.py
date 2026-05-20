@@ -2,7 +2,6 @@ import json
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -904,9 +903,6 @@ class CPACodexKeeper:
 
         if disabled:
             if below_threshold:
-                if tracked_next_check_at is None:
-                    logger.log("INFO", "已禁用且未被 keeper 纳入自动复查，保持禁用", indent=1)
-                    return None, effective_disabled
                 if secondary_present:
                     logger.log(
                         "WARN",
@@ -920,10 +916,13 @@ class CPACodexKeeper:
                         indent=1,
                     )
                 if self._enable_with_verification(name, logger):
-                    if self._remove_tracked_account(name):
-                        logger.log("ENABLE", "账号已重新启用", indent=1)
+                    if tracked_next_check_at is not None:
+                        if self._remove_tracked_account(name):
+                            logger.log("ENABLE", "账号已重新启用", indent=1)
+                        else:
+                            logger.log("ERROR", "账号已确认启用，但移除复查计划失败", indent=1)
                     else:
-                        logger.log("ERROR", "账号已确认启用，但移除复查计划失败", indent=1)
+                        logger.log("ENABLE", "账号已重新启用", indent=1)
                     self._inc_stat("enabled")
                     effective_disabled = False
                 else:
@@ -936,7 +935,7 @@ class CPACodexKeeper:
                     "quota_without_refresh_token",
                     logger,
                 ), effective_disabled
-            if tracked_next_check_at is not None and body_info is not None and now is not None:
+            if body_info is not None and now is not None:
                 next_check_at = self._compute_next_check_at_from_usage(
                     body_info,
                     now,
@@ -1097,7 +1096,6 @@ class CPACodexKeeper:
                 self._clear_tracked_recheck_detail_failure(name)
 
             disabled, remaining_seconds, remaining_str, expiry_known = self._log_token_details(token_detail, logger)
-            tracked_next_check_at = self._get_tracked_next_check_at(name)
             now = int(time.time())
             cleanup_result = self._apply_non_refreshable_expiry_policy(name, token_detail, remaining_seconds, expiry_known, logger)
             if cleanup_result:
@@ -1106,15 +1104,6 @@ class CPACodexKeeper:
             account_id = token_detail.get("account_id")
             if not access_token:
                 return self._skip_token("缺少 access_token", logger)
-            if disabled and tracked_next_check_at is not None and now < tracked_next_check_at:
-                logger.log(
-                    "INFO",
-                    f"当前账号已禁用，计划于 {self._format_tracked_next_check_at(tracked_next_check_at)} 后复查额度，当前轮次跳过",
-                    indent=1,
-                )
-                self._inc_stat("alive")
-                logger.blank_line()
-                return "alive"
 
             status, resp_data = self.check_token_live(access_token, account_id)
             if status in (401, 402):
@@ -1191,42 +1180,38 @@ class CPACodexKeeper:
         lines.append(self.logger.format_log_record("INFO", "=" * 60))
         self.logger.emit_lines(lines)
 
+    def _sleep_between_full_scan_tokens(self):
+        delay_seconds = random.randint(
+            self.settings.full_scan_min_interval_seconds,
+            self.settings.full_scan_max_interval_seconds,
+        )
+        self.log("INFO", f"主巡检节流等待：{delay_seconds} 秒后继续下一个账号")
+        time.sleep(delay_seconds)
+
     def _process_tokens_with_priority(self, tokens, *, force_refresh_on_expiry=None):
         total = len(tokens)
-        token_iter = iter(enumerate(tokens, 1))
-        token_iter_lock = threading.Lock()
-
-        def worker():
-            while True:
-                with token_iter_lock:
-                    try:
-                        idx, token_info = next(token_iter)
-                    except StopIteration:
-                        return
-                self._acquire_priority("full")
+        for idx, token_info in enumerate(tokens, 1):
+            self._acquire_priority("full")
+            try:
                 try:
-                    try:
-                        if force_refresh_on_expiry is None:
-                            self.process_token(token_info, idx, total)
-                        else:
-                            self.process_token(
-                                token_info,
-                                idx,
-                                total,
-                                force_refresh_on_expiry=force_refresh_on_expiry,
-                            )
-                    except Exception as exc:
-                        token_name = token_info.get("name", "unknown")
-                        self.log("ERROR", f"Token 任务异常 ({token_name}): {exc}", indent=1)
-                        self.blank_line()
-                finally:
-                    self._release_priority("full")
+                    if force_refresh_on_expiry is None:
+                        self.process_token(token_info, idx, total)
+                    else:
+                        self.process_token(
+                            token_info,
+                            idx,
+                            total,
+                            force_refresh_on_expiry=force_refresh_on_expiry,
+                        )
+                except Exception as exc:
+                    token_name = token_info.get("name", "unknown")
+                    self.log("ERROR", f"Token 任务异常 ({token_name}): {exc}", indent=1)
+                    self.blank_line()
+            finally:
+                self._release_priority("full")
 
-        with ThreadPoolExecutor(max_workers=self.settings.worker_threads) as executor:
-            worker_count = min(total, self.settings.worker_threads)
-            futures = [executor.submit(worker) for _ in range(worker_count)]
-            for future in as_completed(futures):
-                future.result()
+            if idx < total:
+                self._sleep_between_full_scan_tokens()
 
     def run(self, *, force_refresh_on_expiry=None):
         self.reset_stats()
@@ -1241,7 +1226,10 @@ class CPACodexKeeper:
         start_time = time.time()
         total = len(tokens)
         self.log("INFO", f"主巡检任务已就绪：本轮共 {total} 个 codex 账号 待处理")
-        self.log("INFO", f"主巡检并发设置：{self.settings.worker_threads} 个工作线程")
+        self.log(
+            "INFO",
+            f"主巡检执行策略：逐账号串行扫描，账号间等待 {self.settings.full_scan_min_interval_seconds}-{self.settings.full_scan_max_interval_seconds} 秒",
+        )
         self.blank_line()
 
         self._process_tokens_with_priority(tokens, force_refresh_on_expiry=force_refresh_on_expiry)
@@ -1253,7 +1241,11 @@ class CPACodexKeeper:
             self.logger.format_log_record("INFO", "执行总结"),
             self.logger.format_log_record("INFO", f"总耗时: {elapsed:.1f} 秒", indent=1),
             self.logger.format_log_record("INFO", f"账号总数: {stats['total']}", indent=1),
-            self.logger.format_log_record("INFO", f"工作线程: {self.settings.worker_threads}", indent=1),
+            self.logger.format_log_record(
+                "INFO",
+                f"扫描节流: {self.settings.full_scan_min_interval_seconds}-{self.settings.full_scan_max_interval_seconds} 秒",
+                indent=1,
+            ),
             self.logger.format_log_record("INFO", "状态统计"),
             self.logger.format_log_record("OK", f"存活: {stats['alive']}", indent=1),
             self.logger.format_log_record("DELETE", f"死号(已删除): {stats['dead']}", indent=1),

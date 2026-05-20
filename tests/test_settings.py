@@ -77,6 +77,50 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.usage_query_interval_seconds, 7200)
 
+    def test_load_settings_uses_default_full_scan_interval_bounds(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.full_scan_min_interval_seconds, 10)
+        self.assertEqual(settings.full_scan_max_interval_seconds, 60)
+
+    def test_load_settings_reads_full_scan_interval_bounds(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_FULL_SCAN_MIN_INTERVAL_SECONDS": "15",
+                "CPA_FULL_SCAN_MAX_INTERVAL_SECONDS": "45",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.full_scan_min_interval_seconds, 15)
+        self.assertEqual(settings.full_scan_max_interval_seconds, 45)
+
+    def test_load_settings_rejects_inverted_full_scan_interval_bounds(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CPA_ENDPOINT": "https://example.com",
+                "CPA_TOKEN": "secret",
+                "CPA_FULL_SCAN_MIN_INTERVAL_SECONDS": "50",
+                "CPA_FULL_SCAN_MAX_INTERVAL_SECONDS": "20",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(SettingsError):
+                load_settings()
+
     def test_load_settings_uses_default_enable_verify_values(self):
         with patch.dict(
             os.environ,
