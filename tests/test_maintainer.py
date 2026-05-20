@@ -213,13 +213,16 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(self.maintainer.stats.disabled, 1)
 
     def test_process_token_enables_when_disabled_and_weekly_quota_below_threshold(self):
-        self.maintainer.get_token_detail = Mock(return_value={
-            "email": "a@example.com",
-            "disabled": True,
-            "access_token": "token",
-            "account_id": "acc",
-            "expired": "2099-01-01T00:00:00Z",
-        })
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t3", "disabled": False},
+        ])
         self.maintainer.check_token_live = Mock(return_value=(200, {
             "json": {
                 "plan_type": "team",
@@ -231,10 +234,11 @@ class MaintainerTests(unittest.TestCase):
             }
         }))
         self.maintainer.set_disabled_status = Mock(return_value=True)
-        result = self.maintainer.process_token({"name": "t3"}, 1, 1)
+        with patch("src.maintainer.time.sleep"):
+            result = self.maintainer.process_token({"name": "t3"}, 1, 1)
         self.assertEqual(result, "alive")
-        self.maintainer.set_disabled_status.assert_not_called()
-        self.assertEqual(self.maintainer.stats.enabled, 0)
+        self.maintainer.set_disabled_status.assert_called_once_with("t3", disabled=False, logger=ANY)
+        self.assertEqual(self.maintainer.stats.enabled, 1)
 
     def test_settings_accepts_quota_reset_none_recheck_seconds(self):
         settings = Settings(
@@ -602,7 +606,7 @@ class MaintainerTests(unittest.TestCase):
             1050,
         )
 
-    def test_process_token_skips_usage_before_tracked_next_check(self):
+    def test_process_token_checks_usage_even_before_tracked_next_check(self):
         self.maintainer.get_token_detail = Mock(return_value={
             "email": "a@example.com",
             "disabled": True,
@@ -612,17 +616,22 @@ class MaintainerTests(unittest.TestCase):
             "expired": "2099-01-01T00:00:00Z",
         })
         self.maintainer._tracked_disabled_accounts = {"t-skip": {"next_check_at": 2000}}
-        self.maintainer.check_token_live = Mock(return_value=(200, {"json": {}}))
-        captured_lines = []
-        self.maintainer.logger.emit_lines = Mock(side_effect=lambda lines: captured_lines.append(list(lines)))
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "free",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0, "limit_window_seconds": 604800},
+                    "secondary_window": None,
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
 
         with patch("src.maintainer.time.time", return_value=1000):
             result = self.maintainer.process_token({"name": "t-skip"}, 1, 1)
 
         self.assertEqual(result, "alive")
-        self.maintainer.check_token_live.assert_not_called()
-        self.assertTrue(captured_lines)
-        self.assertIn("1970-01-01 08:33:20", "\n".join(captured_lines[0]))
+        self.maintainer.check_token_live.assert_called_once_with("token", "acc")
 
     def test_process_token_checks_usage_for_manually_enabled_tracked_token(self):
         self.maintainer.get_token_detail = Mock(return_value={
@@ -705,6 +714,32 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(result, "alive")
         self.assertEqual(self.maintainer._get_tracked_next_check_at("t-auto"), 1777000096)
 
+    def test_process_token_backfills_tracked_state_for_disabled_over_quota_account(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "email": "a@example.com",
+            "disabled": True,
+            "access_token": "token",
+            "refresh_token": "rt",
+            "account_id": "acc",
+            "expired": "2099-01-01T00:00:00Z",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 10, "limit_window_seconds": 18000, "reset_at": 1776634820},
+                    "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800, "reset_at": 1777000096},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+
+        with patch("src.maintainer.time.time", return_value=1000):
+            result = self.maintainer.process_token({"name": "t-disabled-backfill"}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.assertEqual(self.maintainer._get_tracked_next_check_at("t-disabled-backfill"), 1777000096)
+
     def test_process_token_enables_tracked_disabled_token_when_due_and_below_threshold(self):
         captured_lines = []
         self.maintainer.logger.emit_lines = Mock(side_effect=lambda lines: captured_lines.append(list(lines)))
@@ -740,6 +775,38 @@ class MaintainerTests(unittest.TestCase):
         self.assertIsNone(self.maintainer._get_tracked_next_check_at("t-enable"))
         emitted = "\n".join(captured_lines[0])
         self.assertIn("账号已重新启用", emitted)
+
+    def test_process_token_enables_untracked_disabled_account_when_quota_recovers(self):
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t-enable-untracked", "disabled": False},
+        ])
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1776634820},
+                    "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 1777000096},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        with patch("src.maintainer.time.time", return_value=1000), patch("src.maintainer.time.sleep"):
+            result = self.maintainer.process_token({"name": "t-enable-untracked"}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.maintainer.set_disabled_status.assert_called_once_with("t-enable-untracked", disabled=False, logger=ANY)
+        self.assertEqual(self.maintainer.stats.enabled, 1)
+        self.assertIsNone(self.maintainer._get_tracked_next_check_at("t-enable-untracked"))
 
     def test_process_token_retries_enable_until_verification_succeeds(self):
         self.maintainer.settings.enable_verify_delay_seconds = 5
@@ -1148,15 +1215,18 @@ class MaintainerTests(unittest.TestCase):
         emitted = "\n".join(line for batch in captured_lines for line in batch)
         self.assertIn("自动复查连续 3 次获取账号详情失败，视为账号文件已丢失，已停止继续复查", emitted)
 
-    def test_process_token_keeps_manual_disabled_token_disabled_when_below_threshold(self):
-        self.maintainer.get_token_detail = Mock(return_value={
-            "email": "a@example.com",
-            "disabled": True,
-            "access_token": "token",
-            "refresh_token": "rt",
-            "account_id": "acc",
-            "expired": "2099-01-01T00:00:00Z",
-        })
+    def test_process_token_enables_manual_disabled_token_when_below_threshold(self):
+        self.maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": "2099-01-01T00:00:00Z",
+            },
+            {"name": "t-manual-disabled", "disabled": False},
+        ])
         self.maintainer.check_token_live = Mock(return_value=(200, {
             "json": {
                 "plan_type": "team",
@@ -1169,11 +1239,12 @@ class MaintainerTests(unittest.TestCase):
         }))
         self.maintainer.set_disabled_status = Mock(return_value=True)
 
-        result = self.maintainer.process_token({"name": "t-manual-disabled"}, 1, 1)
+        with patch("src.maintainer.time.sleep"):
+            result = self.maintainer.process_token({"name": "t-manual-disabled"}, 1, 1)
 
         self.assertEqual(result, "alive")
-        self.maintainer.set_disabled_status.assert_not_called()
-        self.assertEqual(self.maintainer.stats.enabled, 0)
+        self.maintainer.set_disabled_status.assert_called_once_with("t-manual-disabled", disabled=False, logger=ANY)
+        self.assertEqual(self.maintainer.stats.enabled, 1)
 
     def test_process_token_detail_failure_does_not_count_for_normal_run(self):
         self.maintainer.get_token_detail = Mock(return_value=None)
@@ -1650,7 +1721,7 @@ class MaintainerTests(unittest.TestCase):
         maintainer.upload_updated_token.assert_not_called()
         self.assertEqual(maintainer.stats.refreshed, 0)
 
-    def test_process_token_refreshes_manual_disabled_token_near_expiry_and_keeps_disabled(self):
+    def test_process_token_refreshes_reenabled_account_near_expiry(self):
         settings = Settings(
             cpa_endpoint="https://example.com",
             cpa_token="secret",
@@ -1660,14 +1731,17 @@ class MaintainerTests(unittest.TestCase):
         )
         maintainer = CPACodexKeeper(settings=settings, dry_run=True)
         near_expiry = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        maintainer.get_token_detail = Mock(return_value={
-            "email": "a@example.com",
-            "disabled": True,
-            "access_token": "token",
-            "refresh_token": "rt",
-            "account_id": "acc",
-            "expired": near_expiry,
-        })
+        maintainer.get_token_detail = Mock(side_effect=[
+            {
+                "email": "a@example.com",
+                "disabled": True,
+                "access_token": "token",
+                "refresh_token": "rt",
+                "account_id": "acc",
+                "expired": near_expiry,
+            },
+            {"name": "t4-enabled-disabled", "disabled": False},
+        ])
         maintainer.check_token_live = Mock(return_value=(200, {
             "json": {
                 "plan_type": "team",
@@ -1686,13 +1760,15 @@ class MaintainerTests(unittest.TestCase):
         maintainer.set_disabled_status = Mock(return_value=True)
         maintainer.upload_updated_token = Mock(return_value=True)
 
-        result = maintainer.process_token({"name": "t4-enabled-disabled"}, 1, 1)
+        with patch("src.maintainer.time.sleep"):
+            result = maintainer.process_token({"name": "t4-enabled-disabled"}, 1, 1)
 
         self.assertEqual(result, "alive")
-        maintainer.try_refresh.assert_called_once()
-        maintainer.upload_updated_token.assert_called_once()
-        maintainer.set_disabled_status.assert_called_once_with("t4-enabled-disabled", disabled=True, logger=ANY)
-        self.assertEqual(maintainer.stats.refreshed, 1)
+        maintainer.try_refresh.assert_not_called()
+        maintainer.upload_updated_token.assert_not_called()
+        maintainer.set_disabled_status.assert_called_once_with("t4-enabled-disabled", disabled=False, logger=ANY)
+        self.assertEqual(maintainer.stats.enabled, 1)
+        self.assertEqual(maintainer.stats.refreshed, 0)
 
     def test_process_token_deletes_expired_token_without_refresh_token(self):
         self.maintainer.get_token_detail = Mock(return_value={
@@ -1784,58 +1860,31 @@ class MaintainerTests(unittest.TestCase):
         self.maintainer.check_token_live.assert_called_once()
 
     @patch("src.maintainer.random.shuffle", side_effect=lambda seq: None)
-    @patch("src.maintainer.as_completed")
-    @patch("src.maintainer.ThreadPoolExecutor")
-    def test_run_uses_configured_worker_threads_and_processes_all_tokens(self, executor_cls, as_completed_mock, _shuffle_mock):
+    def test_run_processes_tokens_sequentially(self, _shuffle_mock):
         tokens = [{"name": "t1"}, {"name": "t2"}, {"name": "t3"}]
-        self.maintainer.settings.worker_threads = 6
         self.maintainer.get_token_list = Mock(return_value=tokens)
         self.maintainer.log_startup = Mock()
+        self.maintainer._sleep_between_full_scan_tokens = Mock()
+        call_order = []
 
-        futures = []
+        def process_side_effect(token_info, idx, total, **kwargs):
+            call_order.append((token_info["name"], idx, total))
+            return "alive"
 
-        def submit_side_effect(fn):
-            future = Future()
-            future.set_result(fn())
-            futures.append(future)
-            return future
-
-        executor = executor_cls.return_value.__enter__.return_value
-        executor.submit.side_effect = submit_side_effect
-        as_completed_mock.side_effect = lambda items: list(items)
-        self.maintainer.process_token = Mock(side_effect=["alive", "alive", "alive"])
+        self.maintainer.process_token = Mock(side_effect=process_side_effect)
 
         self.maintainer.run()
 
-        executor_cls.assert_called_once_with(max_workers=6)
-        self.assertEqual(executor.submit.call_count, 3)
-        self.maintainer.process_token.assert_any_call({"name": "t1"}, 1, 3)
-        self.maintainer.process_token.assert_any_call({"name": "t2"}, 2, 3)
-        self.maintainer.process_token.assert_any_call({"name": "t3"}, 3, 3)
+        self.assertEqual(call_order, [("t1", 1, 3), ("t2", 2, 3), ("t3", 3, 3)])
+        self.assertEqual(self.maintainer._sleep_between_full_scan_tokens.call_count, 2)
 
     @patch("src.maintainer.random.shuffle", side_effect=lambda seq: None)
-    @patch("src.maintainer.as_completed")
-    @patch("src.maintainer.ThreadPoolExecutor")
-    def test_run_logs_task_exception_and_continues(self, executor_cls, as_completed_mock, _shuffle_mock):
+    def test_run_logs_task_exception_and_continues(self, _shuffle_mock):
         tokens = [{"name": "ok-1"}, {"name": "boom"}, {"name": "ok-2"}]
         self.maintainer.get_token_list = Mock(return_value=tokens)
         self.maintainer.log_startup = Mock()
         self.maintainer.log = Mock()
-
-        futures = []
-
-        def submit_side_effect(fn):
-            future = Future()
-            try:
-                future.set_result(fn())
-            except Exception as exc:
-                future.set_exception(exc)
-            futures.append(future)
-            return future
-
-        executor = executor_cls.return_value.__enter__.return_value
-        executor.submit.side_effect = submit_side_effect
-        as_completed_mock.side_effect = lambda items: list(items)
+        self.maintainer._sleep_between_full_scan_tokens = Mock()
 
         def process_side_effect(token_info, idx, total):
             if token_info["name"] == "boom":
@@ -1850,23 +1899,14 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(self.maintainer.process_token.call_count, 3)
         self.assertEqual(self.maintainer.stats.alive, 2)
         self.maintainer.log.assert_any_call("ERROR", "Token 任务异常 (boom): unexpected boom", indent=1)
+        self.assertEqual(self.maintainer._sleep_between_full_scan_tokens.call_count, 2)
 
     @patch("src.maintainer.random.shuffle", side_effect=lambda seq: None)
-    @patch("src.maintainer.as_completed")
-    @patch("src.maintainer.ThreadPoolExecutor")
-    def test_run_preserves_total_stat_with_threaded_execution(self, executor_cls, as_completed_mock, _shuffle_mock):
+    def test_run_preserves_total_stat_with_sequential_execution(self, _shuffle_mock):
         tokens = [{"name": "t1"}, {"name": "t2"}]
         self.maintainer.get_token_list = Mock(return_value=tokens)
         self.maintainer.log_startup = Mock()
-
-        def submit_side_effect(fn):
-            future = Future()
-            future.set_result(fn())
-            return future
-
-        executor = executor_cls.return_value.__enter__.return_value
-        executor.submit.side_effect = submit_side_effect
-        as_completed_mock.side_effect = lambda items: list(items)
+        self.maintainer._sleep_between_full_scan_tokens = Mock()
 
         def process_side_effect(token_info, idx, total):
             if token_info["name"] == "t1":
@@ -1884,28 +1924,45 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(self.maintainer.stats.skipped, 1)
 
     @patch("src.maintainer.random.shuffle", side_effect=lambda seq: None)
-    @patch("src.maintainer.as_completed")
-    @patch("src.maintainer.ThreadPoolExecutor")
-    def test_run_logs_configured_worker_threads(self, executor_cls, as_completed_mock, _shuffle_mock):
+    def test_run_logs_sequential_scan_strategy(self, _shuffle_mock):
         tokens = [{"name": "t1"}]
-        self.maintainer.settings.worker_threads = 5
+        self.maintainer.settings.full_scan_min_interval_seconds = 10
+        self.maintainer.settings.full_scan_max_interval_seconds = 60
         self.maintainer.get_token_list = Mock(return_value=tokens)
         self.maintainer.log_startup = Mock()
         self.maintainer.log = Mock()
-
-        def submit_side_effect(fn):
-            future = Future()
-            future.set_result(fn())
-            return future
-
-        executor = executor_cls.return_value.__enter__.return_value
-        executor.submit.side_effect = submit_side_effect
-        as_completed_mock.side_effect = lambda items: list(items)
         self.maintainer.process_token = Mock(return_value="alive")
 
         self.maintainer.run()
 
-        self.maintainer.log.assert_any_call("INFO", "主巡检并发设置：5 个工作线程")
+        self.maintainer.log.assert_any_call(
+            "INFO",
+            "主巡检执行策略：逐账号串行扫描，账号间等待 10-60 秒",
+        )
+
+    @patch("src.maintainer.random.shuffle", side_effect=lambda seq: None)
+    def test_run_does_not_sleep_after_last_token(self, _shuffle_mock):
+        tokens = [{"name": "t1"}]
+        self.maintainer.get_token_list = Mock(return_value=tokens)
+        self.maintainer.log_startup = Mock()
+        self.maintainer._sleep_between_full_scan_tokens = Mock()
+        self.maintainer.process_token = Mock(return_value="alive")
+
+        self.maintainer.run()
+
+        self.maintainer._sleep_between_full_scan_tokens.assert_not_called()
+
+    def test_sleep_between_full_scan_tokens_uses_configured_bounds(self):
+        self.maintainer.settings.full_scan_min_interval_seconds = 10
+        self.maintainer.settings.full_scan_max_interval_seconds = 60
+        self.maintainer.log = Mock()
+
+        with patch("src.maintainer.random.randint", return_value=30) as randint_mock, patch("src.maintainer.time.sleep") as sleep_mock:
+            self.maintainer._sleep_between_full_scan_tokens()
+
+        randint_mock.assert_called_once_with(10, 60)
+        sleep_mock.assert_called_once_with(30)
+        self.maintainer.log.assert_any_call("INFO", "主巡检节流等待：30 秒后继续下一个账号")
 
     def test_scan_due_tracked_rechecks_runs_due_account(self):
         self.maintainer._tracked_disabled_accounts = {

@@ -70,12 +70,12 @@ Each inspection round follows this sequence:
 11. if automatic refresh is explicitly enabled and the token is still disabled after quota handling and close to expiry, refresh it
 12. upload the refreshed token payload back to CPA
 
-This process is **round-based with intra-round concurrency**. One full round still completes before the next round starts, but multiple tokens can be inspected concurrently within the same round.
+This process is **round-based and sequential per account**. One full round still completes before the next round starts. Within a round, codex accounts are inspected one by one, with a configured delay between accounts to avoid excessive pressure.
 
 In daemon mode, two additional paths may run alongside the main full scan:
 
 - When `CPA_USAGE_QUERY_INTERVAL > 0`, the keeper also starts a log-driven inspection loop based on `/v0/management/usage`. It compares against the previous query time, keeps only accounts that had new usage in that interval and still exist in filtered codex auth-files, then runs quota checks only for those accounts. This log-driven loop only disables; it does not re-enable, refresh, or delete.
-- For accounts auto-disabled by the keeper and written into `disabled_accounts.json`, the keeper records `next_check_at` and arms an independent timer. When the timer fires, quota is rechecked immediately; if quota has recovered the account is re-enabled, otherwise a new recheck time is scheduled.
+- For accounts auto-disabled by the keeper and written into `disabled_accounts.json`, the keeper records `next_check_at` and arms an independent timer. When the timer fires, quota is rechecked immediately; if quota has recovered the account is re-enabled, otherwise a new recheck time is scheduled. `disabled_accounts.json` records planned automatic rechecks only; it does not stop the main full scan from inspecting already-disabled accounts.
 
 ---
 
@@ -148,14 +148,16 @@ Then edit `.env`.
 - `CPA_USAGE_TIMEOUT`: timeout for OpenAI usage requests, default `15`
 - `CPA_USAGE_QUERY_INTERVAL`: log inspection interval in seconds, also used as the lookback window when querying `/v0/management/usage`, default `7200`; set to `0` to disable log inspection
 - `CPA_MAX_RETRIES`: retry count for transient network / 5xx failures, default `2`
-- `CPA_WORKER_THREADS`: number of worker threads per inspection round, default `8`
+- `CPA_FULL_SCAN_MIN_INTERVAL_SECONDS`: minimum delay in seconds between accounts during the main full scan, default `10`
+- `CPA_FULL_SCAN_MAX_INTERVAL_SECONDS`: maximum delay in seconds between accounts during the main full scan, default `60`
+- `CPA_WORKER_THREADS`: retained for compatibility, default `8`; the current main full scan now runs sequentially and no longer uses this value to control concurrency
 - `CPA_LOG_ARCHIVE_MAX_SIZE_MB`: total size limit in MB for archived logs under `./logs/archive`, default `500`
 
 The `.env.example` file already includes bilingual comments for direct editing.
 
 Automatic refresh is enabled by default, but the keeper still refreshes only tokens that remain disabled after quota handling; enabled tokens are left to CPA's own auto-refresh logic. If you need to avoid competing with another writer rotating the same shared `refresh_token`, set it to `false` in `.env`.
 
-The keeper maintains `disabled_accounts.json` in the project root to persist the next quota recheck time `next_check_at` for accounts it auto-disabled after reaching `CPA_QUOTA_THRESHOLD`. Only keeper-disabled accounts are tracked there; manually disabled accounts are never auto-enabled. When daemon mode starts, the file is loaded and independent timers are restored; if a recorded time is already in the past, the recheck runs immediately using the normal quota logic. If the threshold-reaching windows do not expose `reset_at`, the first schedule uses `CPA_QUOTA_RESET_NONE_RECHECK_SECONDS`; later due rechecks fall back to `CPA_INTERVAL` when no new `reset_at` appears.
+The keeper maintains `disabled_accounts.json` in the project root to persist the next quota recheck time `next_check_at` for accounts it auto-disabled after reaching `CPA_QUOTA_THRESHOLD`. Its role is to store keeper-managed follow-up recheck plans, not to decide whether the main full scan should inspect an already-disabled account. When daemon mode starts, the file is loaded and independent timers are restored; if a recorded time is already in the past, the recheck runs immediately using the normal quota logic. If the threshold-reaching windows do not expose `reset_at`, the first schedule uses `CPA_QUOTA_RESET_NONE_RECHECK_SECONDS`; later due rechecks fall back to `CPA_INTERVAL` when no new `reset_at` appears. In both one-shot mode and daemon mode, the main full scan still inspects all codex accounts; if a disabled account has recovered quota it is re-enabled, and if a disabled over-threshold account is missing from `disabled_accounts.json`, it is backfilled into tracked state for later automatic rechecks.
 
 When `CPA_ALLOW_DELETE=false`, accounts that would otherwise be deleted are disabled instead, and a history event is appended to `delete_blocked_accounts.json` in the project root; these fallback records do not enter `disabled_accounts.json` and do not participate in automatic rechecks.
 
@@ -195,7 +197,7 @@ python main.py
 
 By default this starts:
 
-- the original full inspection loop
+- the original full inspection loop (sequential per account, with configured pacing between accounts)
 - timer-based rechecks for accounts already recorded in `disabled_accounts.json`
 - and, when `CPA_USAGE_QUERY_INTERVAL > 0`, an additional log-driven inspection thread
 
@@ -250,8 +252,8 @@ docker compose up -d --build
 
 For each token, the tool logs details such as:
 
-- multiple tokens may be inspected concurrently within a round
-- each token log is buffered and emitted as one block so console output does not interleave across threads
+- full scans inspect accounts sequentially within a round, with a paced delay between accounts
+- each token log is emitted as a self-contained block for easier reading
 
 - token name
 - email
