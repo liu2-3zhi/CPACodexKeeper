@@ -11,7 +11,6 @@ DEFAULT_EXPIRY_THRESHOLD_DAYS = 3
 DEFAULT_USAGE_TIMEOUT_SECONDS = 15
 DEFAULT_CPA_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RETRIES = 2
-DEFAULT_WORKER_THREADS = 8
 DEFAULT_FULL_SCAN_MIN_INTERVAL_SECONDS = 10
 DEFAULT_FULL_SCAN_MAX_INTERVAL_SECONDS = 60
 DEFAULT_ENABLE_REFRESH = True
@@ -42,7 +41,6 @@ class Settings:
     usage_timeout_seconds: int = DEFAULT_USAGE_TIMEOUT_SECONDS
     cpa_timeout_seconds: int = DEFAULT_CPA_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_MAX_RETRIES
-    worker_threads: int = DEFAULT_WORKER_THREADS
     full_scan_min_interval_seconds: int = DEFAULT_FULL_SCAN_MIN_INTERVAL_SECONDS
     full_scan_max_interval_seconds: int = DEFAULT_FULL_SCAN_MAX_INTERVAL_SECONDS
     enable_refresh: bool = DEFAULT_ENABLE_REFRESH
@@ -170,7 +168,6 @@ def load_settings(env_file: Path | None = None) -> Settings:
         usage_timeout_seconds=_read_int("CPA_USAGE_TIMEOUT", DEFAULT_USAGE_TIMEOUT_SECONDS, env_values, minimum=1),
         cpa_timeout_seconds=_read_int("CPA_HTTP_TIMEOUT", DEFAULT_CPA_TIMEOUT_SECONDS, env_values, minimum=1),
         max_retries=_read_int("CPA_MAX_RETRIES", DEFAULT_MAX_RETRIES, env_values, minimum=0, maximum=5),
-        worker_threads=_read_int("CPA_WORKER_THREADS", DEFAULT_WORKER_THREADS, env_values, minimum=1),
         full_scan_min_interval_seconds=full_scan_min_interval_seconds,
         full_scan_max_interval_seconds=full_scan_max_interval_seconds,
         enable_refresh=_read_bool("CPA_ENABLE_REFRESH", DEFAULT_ENABLE_REFRESH, env_values),

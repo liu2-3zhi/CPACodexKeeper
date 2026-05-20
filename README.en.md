@@ -150,7 +150,6 @@ Then edit `.env`.
 - `CPA_FILL_INTERVAL`: log inspection polling interval in seconds, default `10`; set it to `0` or a negative value to disable log inspection
 - `CPA_FULL_SCAN_MIN_INTERVAL_SECONDS`: minimum delay in seconds between accounts during the main full scan, default `10`
 - `CPA_FULL_SCAN_MAX_INTERVAL_SECONDS`: maximum delay in seconds between accounts during the main full scan, default `60`
-- `CPA_WORKER_THREADS`: retained for compatibility, default `8`; the current main full scan now runs sequentially and no longer uses this value to control concurrency
 - `CPA_LOG_ARCHIVE_MAX_SIZE_MB`: total size limit in MB for archived logs under `./logs/archive`, default `500`
 
 The `.env.example` file already includes bilingual comments for direct editing.
