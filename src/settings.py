@@ -138,14 +138,14 @@ def load_settings(env_file: Path | None = None) -> Settings:
         "CPA_FULL_SCAN_MIN_INTERVAL_SECONDS",
         DEFAULT_FULL_SCAN_MIN_INTERVAL_SECONDS,
         env_values,
-        minimum=10,
+        minimum=0,
         maximum=60,
     )
     full_scan_max_interval_seconds = _read_int(
         "CPA_FULL_SCAN_MAX_INTERVAL_SECONDS",
         DEFAULT_FULL_SCAN_MAX_INTERVAL_SECONDS,
         env_values,
-        minimum=10,
+        minimum=0,
         maximum=60,
     )
     if full_scan_min_interval_seconds > full_scan_max_interval_seconds:
